@@ -341,6 +341,13 @@ async def verify_callback(call: CallbackQuery):
         await award_referral_if_ready(call.from_user.id)
 
 
+@dp.message(Command("huy"))
+async def cmd_huy(message: Message):
+    uid = message.from_user.id
+    await clear_state(uid)
+    await message.answer("❌ Đã hủy thao tác đang thực hiện.", reply_markup=main_keyboard(uid))
+
+
 @dp.message(F.text | F.photo)
 async def text_router(message: Message):
     uid = message.from_user.id
@@ -391,7 +398,7 @@ async def text_router(message: Message):
             return
         if st == "admin_lookup":
             if not text_in.isdigit():
-                await message.answer("Hãy gửi ID Telegram dạng số.")
+                await message.answer("Hãy gửi ID Telegram dạng số. Hoặc dùng /huy để hủy.")
                 return
             target = await user_row(int(text_in))
             await clear_state(uid)
@@ -410,7 +417,7 @@ async def text_router(message: Message):
             return
         if st in ("admin_add", "admin_sub"):
             if not text_in.isdigit() or int(text_in) <= 0:
-                await message.answer("Nhập số điểm nguyên dương.")
+                await message.answer("Nhập số điểm nguyên dương. Hoặc dùng /huy để hủy.")
                 return
             target_id = int(data)
             amount = int(text_in) * (1 if st == "admin_add" else -1)
@@ -463,7 +470,6 @@ async def text_router(message: Message):
         if st == "group_chat":
             join_url = text_in.strip()
             try:
-                # Trích xuất username/channel từ link hoặc chuỗi gửi vào
                 match = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})/?(?:\?.*)?$", join_url)
                 if match:
                     chat_ref = "@" + match.group(1)
@@ -475,7 +481,6 @@ async def text_router(message: Message):
                 else:
                     raise ValueError("invalid public Telegram link")
 
-                # Thử lấy thông tin chat nếu được, nếu không sẽ tự tạo tên hiển thị từ link
                 title = chat_ref
                 chat_id = chat_ref
                 try:
@@ -485,7 +490,6 @@ async def text_router(message: Message):
                 except Exception:
                     pass
 
-                # Lưu trực tiếp vào cơ sở dữ liệu không cần check quyền Admin của Bot
                 async with pool.acquire() as c:
                     await c.execute(
                         "INSERT INTO required_groups(chat_id,title,join_url) VALUES($1,$2,$3) "
@@ -632,18 +636,18 @@ async def admin_actions(call: CallbackQuery):
     await call.answer()
     if action == "user":
         await set_state(call.from_user.id, "admin_lookup")
-        await call.message.answer("Gửi ID Telegram người dùng cần kiểm tra.")
+        await call.message.answer("Gửi ID Telegram người dùng cần kiểm tra (hoặc gửi /huy để hủy).")
     elif action == "stats":
         async with pool.acquire() as c:
-            total, locked, bal, pending, approved = await c.fetchrow("""SELECT
-              (SELECT COUNT(*) FROM users), (SELECT COUNT(*) FROM users WHERE locked),
-              (SELECT COALESCE(SUM(balance),0) FROM users),
-              (SELECT COUNT(*) FROM withdrawals WHERE status='awaiting_admin'),
-              (SELECT COUNT(*) FROM withdrawals WHERE status='approved')""")
+            total = await c.fetchval("SELECT COUNT(*) FROM users") or 0
+            locked = await c.fetchval("SELECT COUNT(*) FROM users WHERE locked=1") or 0
+            bal = await c.fetchval("SELECT COALESCE(SUM(balance),0) FROM users") or 0
+            pending = await c.fetchval("SELECT COUNT(*) FROM withdrawals WHERE status='awaiting_admin'") or 0
+            approved = await c.fetchval("SELECT COUNT(*) FROM withdrawals WHERE status='approved'") or 0
         await call.message.answer(f"📊 <b>THỐNG KÊ</b>\nNgười dùng: {total}\nĐang khóa: {locked}\nTổng số dư: {bal:,} điểm\nYêu cầu chờ duyệt: {pending}\nĐã duyệt: {approved}")
     elif action == "broadcast":
         await set_state(call.from_user.id, "admin_broadcast")
-        await call.message.answer("Gửi nội dung hoặc ảnh kèm chú thích để phát cho tất cả người dùng. Gửi một tin nhắn duy nhất.")
+        await call.message.answer("Gửi nội dung hoặc ảnh kèm chú thích để phát cho tất cả người dùng (gửi một tin nhắn duy nhất hoặc /huy để hủy).")
     elif action == "withdrawals":
         async with pool.acquire() as c:
             rows = await c.fetch("SELECT id,user_id,amount,created_at FROM withdrawals WHERE status='awaiting_admin' ORDER BY created_at DESC LIMIT 20")
@@ -673,7 +677,7 @@ async def group_actions(call: CallbackQuery):
     action = call.data.split(":", 1)[1]
     if action == "add":
         await set_state(call.from_user.id, "group_chat")
-        await call.message.answer("Gửi link nhóm/kênh công khai, ví dụ: <code>https://t.me/luxyffshare</code> hoặc <code>@luxyffshare</code>.")
+        await call.message.answer("Gửi link nhóm/kênh công khai, ví dụ: <code>https://t.me/luxyffshare</code> hoặc <code>@luxyffshare</code> (hoặc /huy để hủy).")
     elif action == "list":
         async with pool.acquire() as c:
             groups = await c.fetch("SELECT * FROM required_groups ORDER BY id")
@@ -708,7 +712,7 @@ async def user_admin_actions(call: CallbackQuery):
         await call.message.answer(f"✅ Đã reset (xóa) thông tin ngân hàng của người dùng <code>{uid}</code> thành công.")
     elif action in ("add", "sub"):
         await set_state(call.from_user.id, "admin_add" if action == "add" else "admin_sub", str(uid))
-        await call.message.answer("Nhập số điểm cần điều chỉnh.")
+        await call.message.answer("Nhập số điểm cần điều chỉnh (hoặc gửi /huy để hủy).")
     elif action in ("refs", "withdraws"):
         async with pool.acquire() as c:
             if action == "refs":
@@ -736,4 +740,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        log.info("Bot stopped") 
+        log.info("Bot stopped")
