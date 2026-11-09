@@ -1,17 +1,19 @@
-# Telegram Reward Bot (Railway)
+# Telegram Reward Bot — PostgreSQL
 
-## Deploy
-1. Upload this folder to GitHub and connect it to Railway.
-2. In Railway Variables, set:
-   - `BOT_TOKEN`: token from BotFather
-   - `ADMIN_IDS`: Telegram numeric admin IDs, comma-separated
-   - `MIN_WITHDRAW=33000`
-   - `REFERRAL_REWARD=1000`
-   - `LOG_LEVEL=INFO`
-3. Deploy. No Supabase, PostgreSQL URL, or external database credentials are required.
+## Railway setup
+1. Add a PostgreSQL database service to the Railway project.
+2. In the bot service Variables, add/reference `DATABASE_URL` from that PostgreSQL service (Railway variable reference commonly looks like `${{Postgres.DATABASE_URL}}`; use your actual service name).
+3. Keep `BOT_TOKEN` and `ADMIN_IDS` configured. Optional: `MIN_WITHDRAW`, `REFERRAL_REWARD`, `DB_POOL_SIZE`, `LOG_LEVEL`.
+4. Deploy. Tables and indexes are created automatically.
 
-## Storage note
-The bot now uses a local SQLite file (`bot_data.sqlite3`) instead of Supabase/PostgreSQL. To keep balances, users, and histories across Railway redeploys/restarts, attach a Railway Volume to the service and mount it at `/app/data`, then set `DB_PATH=/app/data/bot_data.sqlite3`. Without a persistent volume, Railway may replace the local file during redeploys and stored data can be lost.
+## Persistence
+Users, balances, locked status, referrals, withdrawals, ledger, required groups, settings, and in-progress states are stored in PostgreSQL. Redeploys preserve data while you retain the same database service. Do not delete the database.
 
-## Logs
-Startup and runtime errors are written to Railway Deploy Logs. Keep `LOG_LEVEL=INFO` for normal operation.
+## Existing SQLite data — important
+This version does not automatically import the previous SQLite database. Keep the old bot/database or Railway Volume until the new PostgreSQL bot has been verified. Before switching, save the old SQLite file or `/backup` from the old version. The old SQLite data can be migrated separately; do not run two bot instances polling with the same Telegram token simultaneously.
+
+## Backup
+Admin `/backup` exports all tables to `telegram_bot_backup.json` and sends it in Telegram. Keep this file securely.
+
+## Local run
+Set `BOT_TOKEN`, `ADMIN_IDS`, and `DATABASE_URL`, install `requirements.txt`, then run `python bot.py`.

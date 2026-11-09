@@ -2,10 +2,12 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from typing import Optional
 
-import aiosqlite
+import asyncpg
+import json
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
@@ -13,13 +15,14 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+    InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, FSInputFile
 )
 from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "bot_data.sqlite3").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_PATH = os.getenv("DB_PATH", "data/bot_data.sqlite3").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 MIN_WITHDRAW = int(os.getenv("MIN_WITHDRAW", "33000"))
 REFERRAL_REWARD = int(os.getenv("REFERRAL_REWARD", "1000"))
@@ -72,110 +75,82 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-class SQLiteConnection:
+class PgConnection:
     def __init__(self, conn):
         self.conn = conn
 
     async def execute(self, sql, *args):
-        sql = sql.replace("NOW()", "CURRENT_TIMESTAMP").replace(" FOR UPDATE", "")
-        sql = re.sub(r"\bBIGSERIAL\b", "INTEGER", sql, flags=re.I)
-        sql = re.sub(r"\bTIMESTAMPTZ\b", "TEXT", sql, flags=re.I)
-        sql = re.sub(r"\bBIGINT\b", "INTEGER", sql, flags=re.I)
-        sql = re.sub(r"\bBOOLEAN\b", "INTEGER", sql, flags=re.I)
-        if not args and sql.count(";") > 1:
-            await self.conn.executescript(sql)
-            return None
-        indexes = [int(x) for x in re.findall(r"\$(\d+)", sql)]
-        if indexes:
-            sql = re.sub(r"\$\d+", "?", sql)
-            args = tuple(args[i-1] for i in indexes)
-        cur = await self.conn.execute(sql, args)
-        return cur
-
-    @staticmethod
-    def _row(row):
-        out = dict(row)
-        for key in ("created_at", "updated_at", "decided_at"):
-            value = out.get(key)
-            if isinstance(value, str):
-                try: out[key] = datetime.fromisoformat(value)
-                except ValueError: pass
-        return out
+        return await self.conn.execute(sql, *args)
 
     async def fetchrow(self, sql, *args):
-        cur = await self.execute(sql, *args)
-        row = await cur.fetchone() if cur else None
-        return self._row(row) if row else None
+        row = await self.conn.fetchrow(sql, *args)
+        return dict(row) if row else None
 
     async def fetch(self, sql, *args):
-        cur = await self.execute(sql, *args)
-        rows = await cur.fetchall() if cur else []
-        return [self._row(r) for r in rows]
+        return [dict(r) for r in await self.conn.fetch(sql, *args)]
 
     async def fetchval(self, sql, *args):
-        cur = await self.execute(sql, *args)
-        row = await cur.fetchone() if cur else None
-        return row[0] if row else None
+        return await self.conn.fetchval(sql, *args)
 
     def transaction(self):
-        return SQLiteTransaction(self.conn)
+        return self.conn.transaction()
 
 
-class SQLiteTransaction:
-    def __init__(self, conn): self.conn = conn
-    async def __aenter__(self): await self.conn.execute("BEGIN IMMEDIATE")
-    async def __aexit__(self, typ, value, tb):
-        await (self.conn.rollback() if typ else self.conn.commit())
+class PgPool:
+    def __init__(self, pool):
+        self.pool = pool
 
-
-class SQLitePool:
-    def __init__(self, path): self.path = path
     class Acquire:
-        def __init__(self, path): self.path = path; self.conn = None
+        def __init__(self, pool): self.pool, self.conn = pool, None
         async def __aenter__(self):
-            self.conn = await aiosqlite.connect(self.path, isolation_level=None)
-            self.conn.row_factory = aiosqlite.Row
-            await self.conn.execute("PRAGMA foreign_keys=ON")
-            await self.conn.execute("PRAGMA busy_timeout=10000")
-            return SQLiteConnection(self.conn)
-        async def __aexit__(self, *args): await self.conn.close()
-    def acquire(self): return self.Acquire(self.path)
-    async def close(self): pass
+            self.conn = await self.pool.acquire()
+            return PgConnection(self.conn)
+        async def __aexit__(self, *args):
+            await self.pool.release(self.conn)
+
+    def acquire(self): return self.Acquire(self.pool)
+    async def close(self): await self.pool.close()
 
 
 async def init_db():
     global pool
-    pool = SQLitePool(DB_PATH)
+    if not DATABASE_URL:
+        raise RuntimeError("Thiếu DATABASE_URL. Hãy thêm PostgreSQL service trên Railway và liên kết DATABASE_URL.")
+    dsn = DATABASE_URL
+    if dsn.startswith("postgres://"):
+        dsn = "postgresql://" + dsn[len("postgres://"):]
+    pg = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=int(os.getenv("DB_POOL_SIZE", "10")), command_timeout=60)
+    pool = PgPool(pg)
     async with pool.acquire() as c:
         await c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-          user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-          balance INTEGER NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0,
-          invited_by INTEGER, verified INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT,
+          balance BIGINT NOT NULL DEFAULT 0, locked BOOLEAN NOT NULL DEFAULT FALSE,
+          invited_by BIGINT, verified BOOLEAN NOT NULL DEFAULT FALSE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE TABLE IF NOT EXISTS required_groups (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
-          join_url TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          id BIGSERIAL PRIMARY KEY, chat_id TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+          join_url TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE TABLE IF NOT EXISTS withdrawals (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id),
-          amount INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, decided_at TEXT, decided_by INTEGER
+          id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(user_id),
+          amount BIGINT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), decided_at TIMESTAMPTZ, decided_by BIGINT
         );
         CREATE TABLE IF NOT EXISTS ledger (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id),
-          amount INTEGER NOT NULL, reason TEXT NOT NULL, actor_id INTEGER,
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(user_id),
+          amount BIGINT NOT NULL, reason TEXT NOT NULL, actor_id BIGINT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS user_state (user_id INTEGER PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS user_state (user_id BIGINT PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL DEFAULT '');
         CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status, created_at DESC);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_referral_once ON ledger(user_id, reason) WHERE reason LIKE 'referral:%';
         CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id, created_at DESC);
         """)
         await c.execute("INSERT INTO settings(key,value) VALUES('maintenance','0') ON CONFLICT(key) DO NOTHING")
-    log.info("Local SQLite database ready: %s", DB_PATH)
+    log.info("PostgreSQL database ready")
 
 
 async def get_state(uid: int):
@@ -225,7 +200,7 @@ async def missing_groups(uid: int):
 
 async def verify_keyboard(groups):
     rows = [[InlineKeyboardButton(text=f"📢 Tham gia nhóm {i+1}", url=g["join_url"])] for i, g in enumerate(groups)]
-    rows.append([InlineKeyboardButton(text="✅ Tôi đã tham gia - Xác minh", callback_data="verify")])
+    rows.append([InlineKeyboardButton(text="✅ Tôi đã tham gia", callback_data="verify")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def show_verification(target, uid: int, rejoin=False):
@@ -241,7 +216,7 @@ async def show_verification(target, uid: int, rejoin=False):
     async with pool.acquire() as c:
         await c.execute("UPDATE users SET verified=FALSE WHERE user_id=$1", uid)
     title = "🔐 XÁC MINH THAM GIA NHÓM" if not rejoin else "🔒 BẠN CẦN THAM GIA LẠI NHÓM"
-    body = f"{title}\n━━━━━━━━━━━━━━━━━━\nVui lòng tham gia tất cả nhóm bên dưới rồi bấm Xác minh."
+    body = f"{title}\n━━━━━━━━━━━━━━━━━━\nVui lòng tham gia tất cả nhóm bên dưới rồi bấm “Tôi đã tham gia”."
     kb = await verify_keyboard(groups)
     if isinstance(target, Message):
         await target.answer(body, reply_markup=kb)
@@ -305,6 +280,35 @@ async def callback_user_gate(call: CallbackQuery) -> bool:
         await show_verification(call, uid, rejoin=True)
         return False
     return True
+
+
+@dp.message(Command("backup"))
+async def backup_database(message: Message):
+    """Export all PostgreSQL tables to a portable JSON backup."""
+    if not is_admin(message.from_user.id):
+        return
+    backup_path = None
+    try:
+        tables = ["users", "required_groups", "withdrawals", "ledger", "settings", "user_state"]
+        data = {}
+        async with pool.acquire() as c:
+            for table in tables:
+                rows = await c.fetch(f"SELECT * FROM {table}")
+                data[table] = rows
+        fd, backup_path = tempfile.mkstemp(prefix="telegram_bot_backup_", suffix=".json")
+        os.close(fd)
+        with open(backup_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, default=lambda x: x.isoformat() if hasattr(x, "isoformat") else str(x), indent=2)
+        await message.answer_document(
+            FSInputFile(backup_path, filename="telegram_bot_backup.json"),
+            caption="✅ Bản sao lưu PostgreSQL dạng JSON. Hãy lưu file ở nơi an toàn."
+        )
+    except Exception:
+        log.exception("Database backup failed")
+        await message.answer("❌ Sao lưu thất bại. Hãy kiểm tra Deploy Logs.")
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            os.remove(backup_path)
 
 
 @dp.message(CommandStart())
@@ -446,20 +450,33 @@ async def text_router(message: Message):
             await message.answer(f"📢 Hoàn tất gửi thông báo. Thành công: {ok}, thất bại: {fail}", reply_markup=admin_keyboard())
             return
         if st == "group_chat":
-            parts = text_in.split("|", 1)
-            if len(parts) != 2 or not parts[1].strip():
-                await message.answer("Gửi theo dạng: <code>@username_nhom | https://t.me/username_nhom</code>")
-                return
-            chat_id, join_url = parts[0].strip(), parts[1].strip()
+            # Chỉ cần gửi một link nhóm/kênh công khai, ví dụ https://t.me/luxyffshare
+            join_url = text_in.strip()
             try:
-                chat = await bot.get_chat(chat_id)
+                match = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})/?(?:\?.*)?$", join_url)
+                if match:
+                    chat_ref = "@" + match.group(1)
+                    if not join_url.startswith(("http://", "https://")):
+                        join_url = "https://" + join_url
+                elif re.fullmatch(r"@[A-Za-z0-9_]{5,}", join_url):
+                    chat_ref = join_url
+                    join_url = "https://t.me/" + join_url[1:]
+                else:
+                    raise ValueError("invalid public Telegram link")
+
+                chat = await bot.get_chat(chat_ref)
+                # Bot cần có quyền xem thành viên (nên đặt bot làm quản trị viên nhóm/kênh).
+                bot_member = await bot.get_chat_member(chat_id=chat.id, user_id=(await bot.get_me()).id)
+                if bot_member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+                    await message.answer("⚠️ Đã tìm thấy nhóm nhưng bot chưa là quản trị viên. Hãy thêm bot làm admin trong nhóm/kênh rồi gửi lại link.")
+                    return
                 async with pool.acquire() as c:
-                    await c.execute("INSERT INTO required_groups(chat_id,title,join_url) VALUES($1,$2,$3) ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title,join_url=EXCLUDED.join_url", str(chat.id), chat.title or chat_id, join_url)
+                    await c.execute("INSERT INTO required_groups(chat_id,title,join_url) VALUES($1,$2,$3) ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title,join_url=EXCLUDED.join_url", str(chat.id), chat.title or chat_ref, join_url)
                 await clear_state(uid)
-                await message.answer(f"✅ Đã lưu nhóm: {chat.title}", reply_markup=admin_keyboard())
+                await message.answer(f"✅ Đã thêm nhóm: <b>{chat.title or chat_ref}</b>", reply_markup=admin_keyboard())
             except Exception as e:
                 log.warning("Group add failed: %s", e)
-                await message.answer("Không thêm được nhóm. Hãy kiểm tra username/ID và quyền của bot.")
+                await message.answer("❌ Không thêm được nhóm. Chỉ hỗ trợ link công khai dạng https://t.me/username. Hãy kiểm tra link và thêm bot làm quản trị viên nhóm/kênh.")
             return
     if text_in == "🏧 Rút + nạp 🏧":
         row = await user_row(uid)
@@ -607,7 +624,7 @@ async def group_actions(call: CallbackQuery):
     action = call.data.split(":", 1)[1]
     if action == "add":
         await set_state(call.from_user.id, "group_chat")
-        await call.message.answer("Gửi theo dạng: <code>@username_nhom | https://t.me/username_nhom</code>. Bot phải là admin nhóm/kênh để xác minh thành viên.")
+        await call.message.answer("Chỉ cần gửi link nhóm/kênh công khai, ví dụ: <code>https://t.me/luxyffshare</code>. Bot phải là quản trị viên nhóm/kênh để kiểm tra thành viên.")
     elif action == "list":
         async with pool.acquire() as c:
             groups = await c.fetch("SELECT * FROM required_groups ORDER BY id")
