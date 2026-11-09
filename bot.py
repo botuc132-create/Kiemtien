@@ -39,6 +39,7 @@ pool = None
 
 MAIN_MENU = ["🏧 Rút + nạp 🏧", "👨‍💼 Cá Nhân 👨‍💼", "💌 Mời Bạn bè 💌"]
 ADMIN_MENU = ["🛠 Admin"]
+EXIT_TEXT = "❌ Thoát"
 
 
 def is_admin(uid: int) -> bool:
@@ -51,6 +52,14 @@ def main_keyboard(uid: int) -> ReplyKeyboardMarkup:
     if is_admin(uid):
         rows.append([KeyboardButton(text=ADMIN_MENU[0])])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def exit_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=EXIT_TEXT)]],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
 
 
 def admin_keyboard() -> InlineKeyboardMarkup:
@@ -335,17 +344,24 @@ async def text_router(message: Message):
         return
     if not is_admin(uid) and not await gate(message):
         return
+    # The persistent reply-keyboard exit button must be handled before
+    # state-specific input validation (otherwise it is mistaken for an amount).
+    if text_in == EXIT_TEXT:
+        await clear_state(uid)
+        await message.answer("✅ Đã thoát thao tác.", reply_markup=main_keyboard(uid))
+        return
+
     state = await get_state(uid)
     if state:
         st, data = state["state"], state["data"]
         if st == "withdraw_amount":
             if not text_in.isdigit() or int(text_in) < MIN_WITHDRAW:
-                await message.answer(f"❌ Số tiền tối thiểu là {MIN_WITHDRAW:,} điểm. Vui lòng nhập lại hoặc bấm /cancel.")
+                await message.answer(f"❌ Số tiền tối thiểu là {MIN_WITHDRAW:,} điểm. Vui lòng nhập lại hoặc bấm nút ❌ Thoát bên dưới.", reply_markup=exit_keyboard())
                 return
             amount = int(text_in)
             row = await user_row(uid)
             if not row or row["balance"] < amount:
-                await message.answer("❌ Số dư không đủ. Vui lòng kiểm tra lại hoặc bấm /cancel.")
+                await message.answer("❌ Số dư không đủ. Vui lòng nhập lại hoặc bấm nút ❌ Thoát bên dưới.", reply_markup=exit_keyboard())
                 return
             async with pool.acquire() as c:
                 async with c.transaction():
@@ -356,6 +372,7 @@ async def text_router(message: Message):
                     wid = await c.fetchval("INSERT INTO withdrawals(user_id,amount) VALUES($1,$2) RETURNING id", uid, amount)
                     await c.execute("INSERT INTO ledger(user_id,amount,reason,actor_id) VALUES($1,$2,$3,$4)", uid, -amount, f"withdraw_hold:{wid}", uid)
             await clear_state(uid)
+            await message.answer("Đã nhận số điểm. Chọn xác nhận bên dưới để gửi yêu cầu.", reply_markup=main_keyboard(uid))
             kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Confirm", callback_data=f"wconfirm:{wid}"), InlineKeyboardButton(text="🚫 Cancel", callback_data=f"wcancel:{wid}")]])
             await message.answer(f"Bạn có chắc chắn tạo yêu cầu rút: <b>{amount:,} điểm</b>?\n\n❗ Đây là yêu cầu chờ Admin xem xét, không phải lệnh chuyển tiền tự động.", reply_markup=kb)
             return
@@ -446,11 +463,11 @@ async def text_router(message: Message):
             return
     if text_in == "🏧 Rút + nạp 🏧":
         row = await user_row(uid)
-        await message.answer(f"✅ Số tiền rút tối thiểu là {MIN_WITHDRAW:,} điểm\n\n🏧 Số dư hiện tại: {row['balance']:,} điểm\nNhập số điểm muốn yêu cầu rút hoặc /cancel.")
         await set_state(uid, "withdraw_amount")
+        await message.answer(f"✅ Số tiền rút tối thiểu là {MIN_WITHDRAW:,} điểm\n\n🏧 Số dư hiện tại: {row['balance']:,} điểm\nNhập số điểm muốn yêu cầu rút. Muốn dừng, bấm ❌ Thoát bên dưới.", reply_markup=exit_keyboard())
     elif text_in == "👨‍💼 Cá Nhân 👨‍💼":
         row = await user_row(uid)
-        await message.answer(f"🏧 Số Dư: <b>{row['balance']:,} điểm</b>\n🆔 ID: <code>{uid}</code>")
+        await message.answer(f"🏧 Số Dư: <b>{row['balance']:,} điểm</b>\n🆔 ID: <code>{uid}</code>", reply_markup=exit_keyboard())
     elif text_in == "💌 Mời Bạn bè 💌":
         me = await bot.get_me()
         async with pool.acquire() as c:
