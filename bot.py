@@ -463,6 +463,7 @@ async def text_router(message: Message):
         if st == "group_chat":
             join_url = text_in.strip()
             try:
+                # Trích xuất username/channel từ link hoặc chuỗi gửi vào
                 match = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})/?(?:\?.*)?$", join_url)
                 if match:
                     chat_ref = "@" + match.group(1)
@@ -474,18 +475,28 @@ async def text_router(message: Message):
                 else:
                     raise ValueError("invalid public Telegram link")
 
-                chat = await bot.get_chat(chat_ref)
-                bot_member = await bot.get_chat_member(chat_id=chat.id, user_id=(await bot.get_me()).id)
-                if bot_member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
-                    await message.answer("⚠️ Đã tìm thấy nhóm nhưng bot chưa là quản trị viên. Hãy thêm bot làm admin trong nhóm/kênh rồi gửi lại link.")
-                    return
+                # Thử lấy thông tin chat nếu được, nếu không sẽ tự tạo tên hiển thị từ link
+                title = chat_ref
+                chat_id = chat_ref
+                try:
+                    chat = await bot.get_chat(chat_ref)
+                    chat_id = str(chat.id)
+                    title = chat.title or chat_ref
+                except Exception:
+                    pass
+
+                # Lưu trực tiếp vào cơ sở dữ liệu không cần check quyền Admin của Bot
                 async with pool.acquire() as c:
-                    await c.execute("INSERT INTO required_groups(chat_id,title,join_url) VALUES($1,$2,$3) ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title,join_url=EXCLUDED.join_url", str(chat.id), chat.title or chat_ref, join_url)
+                    await c.execute(
+                        "INSERT INTO required_groups(chat_id,title,join_url) VALUES($1,$2,$3) "
+                        "ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title,join_url=EXCLUDED.join_url", 
+                        chat_id, title, join_url
+                    )
                 await clear_state(uid)
-                await message.answer(f"✅ Đã thêm nhóm: <b>{chat.title or chat_ref}</b>", reply_markup=admin_keyboard())
+                await message.answer(f"✅ Đã thêm nhóm/kênh thành công:\n<b>{title}</b>\nLink: {join_url}", reply_markup=admin_keyboard())
             except Exception as e:
                 log.warning("Group add failed: %s", e)
-                await message.answer("❌ Không thêm được nhóm. Chỉ hỗ trợ link công khai dạng https://t.me/username. Hãy kiểm tra link và thêm bot làm quản trị viên nhóm/kênh.")
+                await message.answer("❌ Link không hợp lệ. Vui lòng gửi link công khai có dạng <code>https://t.me/username</code> hoặc <code>@username</code>.")
             return
 
     if text_in == "🏧 Rút + nạp 🏧":
@@ -662,7 +673,7 @@ async def group_actions(call: CallbackQuery):
     action = call.data.split(":", 1)[1]
     if action == "add":
         await set_state(call.from_user.id, "group_chat")
-        await call.message.answer("Chỉ cần gửi link nhóm/kênh công khai, ví dụ: <code>https://t.me/luxyffshare</code>. Bot phải là quản trị viên nhóm/kênh để kiểm tra thành viên.")
+        await call.message.answer("Gửi link nhóm/kênh công khai, ví dụ: <code>https://t.me/luxyffshare</code> hoặc <code>@luxyffshare</code>.")
     elif action == "list":
         async with pool.acquire() as c:
             groups = await c.fetch("SELECT * FROM required_groups ORDER BY id")
