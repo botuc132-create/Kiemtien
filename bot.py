@@ -288,6 +288,17 @@ async def award_referral_if_ready(uid: int):
             )
             if inserted:
                 await c.execute("UPDATE users SET balance=balance+$2,updated_at=NOW() WHERE user_id=$1", inviter, REFERRAL_REWARD)
+                
+                # Gửi thông báo cho người mời
+                try:
+                    await bot.send_message(
+                        inviter, 
+                        f"🎉 **Chúc mừng!** Bạn đã giới thiệu thành công.\n"
+                        f"🆔 ID người được mời: <code>{uid}</code>\n"
+                        f"💰 Thưởng: **+{REFERRAL_REWARD:,}** điểm"
+                    )
+                except Exception as e:
+                    log.warning("Không thể gửi thông báo giới thiệu cho người dùng %s: %s", inviter, e)
 
 
 async def callback_user_gate(call: CallbackQuery) -> bool:
@@ -344,8 +355,6 @@ async def text_router(message: Message):
         return
     if not is_admin(uid) and not await gate(message):
         return
-    # The persistent reply-keyboard exit button must be handled before
-    # state-specific input validation (otherwise it is mistaken for an amount).
     if text_in == EXIT_TEXT:
         await clear_state(uid)
         await message.answer("✅ Đã thoát thao tác.", reply_markup=main_keyboard(uid))
@@ -446,7 +455,6 @@ async def text_router(message: Message):
             await message.answer(f"📢 Hoàn tất gửi thông báo. Thành công: {ok}, thất bại: {fail}", reply_markup=admin_keyboard())
             return
         if st == "group_chat":
-            # Chỉ cần gửi một link nhóm/kênh công khai, ví dụ https://t.me/luxyffshare
             join_url = text_in.strip()
             try:
                 match = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})/?(?:\?.*)?$", join_url)
@@ -461,7 +469,6 @@ async def text_router(message: Message):
                     raise ValueError("invalid public Telegram link")
 
                 chat = await bot.get_chat(chat_ref)
-                # Bot cần có quyền xem thành viên (nên đặt bot làm quản trị viên nhóm/kênh).
                 bot_member = await bot.get_chat_member(chat_id=chat.id, user_id=(await bot.get_me()).id)
                 if bot_member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
                     await message.answer("⚠️ Đã tìm thấy nhóm nhưng bot chưa là quản trị viên. Hãy thêm bot làm admin trong nhóm/kênh rồi gửi lại link.")
@@ -558,7 +565,6 @@ async def admin_withdraw_decision(call: CallbackQuery):
     await call.message.edit_text(f"Yêu cầu #{wid}: {'ĐÃ DUYỆT' if status == 'approved' else 'ĐÃ TỪ CHỐI'}")
     if status == "approved":
         await bot.send_message(row["user_id"], f"📢 <b>THÔNG BÁO RÚT THÀNH CÔNG</b>\n━━━━━━━━━━━━━━━━━━\n✅ Yêu cầu #{wid} đã được Admin duyệt. Việc chuyển tiền cần được thực hiện riêng ngoài bot.")
-        # Broadcast status notice without claiming an automatic bank transfer.
         async with pool.acquire() as c:
             ids = await c.fetch("SELECT user_id FROM users WHERE locked=FALSE")
         for r in ids:
