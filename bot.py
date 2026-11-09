@@ -1,298 +1,675 @@
 import asyncio
-import html
 import logging
 import os
 import re
-from itertools import count
+from datetime import datetime, timezone
+from typing import Optional
 
+import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 )
 from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = {
-    int(value.strip())
-    for value in os.getenv("ADMIN_IDS", "").split(",")
-    if value.strip().isdigit()
-}
-MIN_WITHDRAW = max(1, int(os.getenv("MIN_WITHDRAW", "33000")))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+DB_PATH = os.getenv("DB_PATH", "bot_data.sqlite3").strip()
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+MIN_WITHDRAW = int(os.getenv("MIN_WITHDRAW", "33000"))
+REFERRAL_REWARD = int(os.getenv("REFERRAL_REWARD", "1000"))
 
-if not TOKEN:
-    raise RuntimeError("Thiếu BOT_TOKEN trong Railway Variables")
-if not ADMIN_IDS:
-    raise RuntimeError("Thiếu ADMIN_IDS trong Railway Variables (ID Telegram của Admin)")
+if not TOKEN or not ADMIN_IDS:
+    raise RuntimeError("Thiếu BOT_TOKEN hoặc ADMIN_IDS trong Railway Variables")
 
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("stateless_withdraw_bot")
+log = logging.getLogger("reward_bot")
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+pool = None
 
-# RAM only: no PostgreSQL, Supabase, SQLite, JSON files, or other persistent storage.
-# These temporary dictionaries are cleared when the process restarts.
-user_flows = {}       # user_id -> {step, draft}
-pending_requests = {} # request_id -> withdrawal request
-request_counter = count(1)
-
-WITHDRAW_BUTTON = "🏧 Rút tiền"
-ADMIN_BUTTON = "🛠 Admin"
-CANCEL_BUTTON = "❌ Hủy thao tác"
+MAIN_MENU = ["🏧 Rút + nạp 🏧", "👨‍💼 Cá Nhân 👨‍💼", "💌 Mời Bạn bè 💌"]
+ADMIN_MENU = ["🛠 Admin"]
+EXIT_TEXT = "❌ Thoát"
 
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
 
 
-def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton(text=WITHDRAW_BUTTON)]]
-    if is_admin(user_id):
-        rows.append([KeyboardButton(text=ADMIN_BUTTON)])
+def main_keyboard(uid: int) -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton(text=MAIN_MENU[0]), KeyboardButton(text=MAIN_MENU[1])],
+            [KeyboardButton(text=MAIN_MENU[2])]]
+    if is_admin(uid):
+        rows.append([KeyboardButton(text=ADMIN_MENU[0])])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-def cancel_keyboard() -> ReplyKeyboardMarkup:
+def exit_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=CANCEL_BUTTON)]],
+        keyboard=[[KeyboardButton(text=EXIT_TEXT)]],
         resize_keyboard=True,
+        one_time_keyboard=False
     )
 
 
-def confirmation_keyboard(request_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Xác nhận gửi Admin", callback_data=f"userconfirm:{request_id}"),
-        InlineKeyboardButton(text="❌ Hủy", callback_data=f"usercancel:{request_id}"),
-    ]])
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Kiểm tra người dùng", callback_data="adm:user")],
+        [InlineKeyboardButton(text="📊 Thống kê", callback_data="adm:stats"), InlineKeyboardButton(text="📢 Thông báo", callback_data="adm:broadcast")],
+        [InlineKeyboardButton(text="💸 Yêu cầu rút", callback_data="adm:withdrawals")],
+        [InlineKeyboardButton(text="👥 Quản lý nhóm", callback_data="adm:groups")],
+        [InlineKeyboardButton(text="🔧 Bảo trì", callback_data="adm:maintenance")],
+    ])
 
 
-def admin_decision_keyboard(request_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Đã duyệt", callback_data=f"adminapprove:{request_id}"),
-        InlineKeyboardButton(text="❌ Từ chối", callback_data=f"adminreject:{request_id}"),
-    ]])
+class SQLiteConnection:
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def execute(self, sql, *args):
+        sql = sql.replace("NOW()", "CURRENT_TIMESTAMP").replace(" FOR UPDATE", "")
+        sql = re.sub(r"\bBIGSERIAL\b", "INTEGER", sql, flags=re.I)
+        sql = re.sub(r"\bTIMESTAMPTZ\b", "TEXT", sql, flags=re.I)
+        sql = re.sub(r"\bBIGINT\b", "INTEGER", sql, flags=re.I)
+        sql = re.sub(r"\bBOOLEAN\b", "INTEGER", sql, flags=re.I)
+        if not args and sql.count(";") > 1:
+            await self.conn.executescript(sql)
+            return None
+        indexes = [int(x) for x in re.findall(r"\$(\d+)", sql)]
+        if indexes:
+            sql = re.sub(r"\$\d+", "?", sql)
+            args = tuple(args[i-1] for i in indexes)
+        cur = await self.conn.execute(sql, args)
+        return cur
+
+    @staticmethod
+    def _row(row):
+        out = dict(row)
+        for key in ("created_at", "updated_at", "decided_at"):
+            value = out.get(key)
+            if isinstance(value, str):
+                try: out[key] = datetime.fromisoformat(value)
+                except ValueError: pass
+        return out
+
+    async def fetchrow(self, sql, *args):
+        cur = await self.execute(sql, *args)
+        row = await cur.fetchone() if cur else None
+        return self._row(row) if row else None
+
+    async def fetch(self, sql, *args):
+        cur = await self.execute(sql, *args)
+        rows = await cur.fetchall() if cur else []
+        return [self._row(r) for r in rows]
+
+    async def fetchval(self, sql, *args):
+        cur = await self.execute(sql, *args)
+        row = await cur.fetchone() if cur else None
+        return row[0] if row else None
+
+    def transaction(self):
+        return SQLiteTransaction(self.conn)
+
+
+class SQLiteTransaction:
+    def __init__(self, conn): self.conn = conn
+    async def __aenter__(self): await self.conn.execute("BEGIN IMMEDIATE")
+    async def __aexit__(self, typ, value, tb):
+        await (self.conn.rollback() if typ else self.conn.commit())
+
+
+class SQLitePool:
+    def __init__(self, path): self.path = path
+    class Acquire:
+        def __init__(self, path): self.path = path; self.conn = None
+        async def __aenter__(self):
+            self.conn = await aiosqlite.connect(self.path, isolation_level=None)
+            self.conn.row_factory = aiosqlite.Row
+            await self.conn.execute("PRAGMA foreign_keys=ON")
+            await self.conn.execute("PRAGMA busy_timeout=10000")
+            return SQLiteConnection(self.conn)
+        async def __aexit__(self, *args): await self.conn.close()
+    def acquire(self): return self.Acquire(self.path)
+    async def close(self): pass
+
+
+async def init_db():
+    global pool
+    pool = SQLitePool(DB_PATH)
+    async with pool.acquire() as c:
+        await c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+          user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+          balance INTEGER NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0,
+          invited_by INTEGER, verified INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS required_groups (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+          join_url TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS withdrawals (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id),
+          amount INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, decided_at TEXT, decided_by INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS ledger (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id),
+          amount INTEGER NOT NULL, reason TEXT NOT NULL, actor_id INTEGER,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS user_state (user_id INTEGER PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL DEFAULT '');
+        CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status, created_at DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_referral_once ON ledger(user_id, reason) WHERE reason LIKE 'referral:%';
+        CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id, created_at DESC);
+        """)
+        await c.execute("INSERT INTO settings(key,value) VALUES('maintenance','0') ON CONFLICT(key) DO NOTHING")
+    log.info("Local SQLite database ready: %s", DB_PATH)
+
+
+async def get_state(uid: int):
+    async with pool.acquire() as c:
+        return await c.fetchrow("SELECT state,data FROM user_state WHERE user_id=$1", uid)
+
+async def set_state(uid: int, state: str, data: str = ""):
+    async with pool.acquire() as c:
+        await c.execute("""INSERT INTO user_state(user_id,state,data) VALUES($1,$2,$3)
+        ON CONFLICT(user_id) DO UPDATE SET state=EXCLUDED.state,data=EXCLUDED.data""", uid, state, data)
+
+async def clear_state(uid: int):
+    async with pool.acquire() as c:
+        await c.execute("DELETE FROM user_state WHERE user_id=$1", uid)
+
+async def ensure_user(user):
+    async with pool.acquire() as c:
+        await c.execute("""INSERT INTO users(user_id,username,first_name) VALUES($1,$2,$3)
+        ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, updated_at=NOW()""",
+                        user.id, user.username, user.first_name)
+
+async def user_row(uid: int):
+    async with pool.acquire() as c:
+        return await c.fetchrow("SELECT * FROM users WHERE user_id=$1", uid)
+
+async def maintenance_on() -> bool:
+    async with pool.acquire() as c:
+        v = await c.fetchval("SELECT value FROM settings WHERE key='maintenance'")
+    return v == "1"
+
+async def group_membership(uid: int, chat_id: str) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=uid)
+        return member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        log.warning("Cannot check membership for group %s: %s", chat_id, e)
+        return False
+
+async def missing_groups(uid: int):
+    async with pool.acquire() as c:
+        groups = await c.fetch("SELECT * FROM required_groups ORDER BY id")
+    missing = []
+    for g in groups:
+        if not await group_membership(uid, g["chat_id"]):
+            missing.append(g)
+    return missing
+
+async def verify_keyboard(groups):
+    rows = [[InlineKeyboardButton(text=f"📢 Tham gia nhóm {i+1}", url=g["join_url"])] for i, g in enumerate(groups)]
+    rows.append([InlineKeyboardButton(text="✅ Tôi đã tham gia", callback_data="verify")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def show_verification(target, uid: int, rejoin=False):
+    groups = await missing_groups(uid)
+    if not groups:
+        async with pool.acquire() as c:
+            await c.execute("UPDATE users SET verified=TRUE, updated_at=NOW() WHERE user_id=$1", uid)
+        if isinstance(target, Message):
+            await target.answer("✅ Xác minh thành công! Menu bot đã được mở.", reply_markup=main_keyboard(uid))
+        else:
+            await target.message.answer("✅ Xác minh thành công! Menu bot đã được mở.", reply_markup=main_keyboard(uid))
+        return True
+    async with pool.acquire() as c:
+        await c.execute("UPDATE users SET verified=FALSE WHERE user_id=$1", uid)
+    title = "🔐 XÁC MINH THAM GIA NHÓM" if not rejoin else "🔒 BẠN CẦN THAM GIA LẠI NHÓM"
+    body = f"{title}\n━━━━━━━━━━━━━━━━━━\nVui lòng tham gia tất cả nhóm bên dưới rồi bấm “Tôi đã tham gia”."
+    kb = await verify_keyboard(groups)
+    if isinstance(target, Message):
+        await target.answer(body, reply_markup=kb)
+    else:
+        await target.message.answer(body, reply_markup=kb)
+    return False
+
+async def gate(message: Message) -> bool:
+    uid = message.from_user.id
+    row = await user_row(uid)
+    if row and row["locked"] and not is_admin(uid):
+        await message.answer("🔒 Tài khoản của bạn hiện đang bị khóa.")
+        return False
+    if await maintenance_on() and not is_admin(uid):
+        await message.answer("🛠 Bot đang bảo trì. Vui lòng quay lại sau.")
+        return False
+    missing = await missing_groups(uid)
+    if missing:
+        await show_verification(message, uid, rejoin=True)
+        return False
+    return True
+
+async def credit(uid: int, amount: int, reason: str, actor: int):
+    async with pool.acquire() as c:
+        async with c.transaction():
+            await c.execute("UPDATE users SET balance=balance+$2,updated_at=NOW() WHERE user_id=$1", uid, amount)
+            await c.execute("INSERT INTO ledger(user_id,amount,reason,actor_id) VALUES($1,$2,$3,$4)", uid, amount, reason, actor)
+
+
+async def award_referral_if_ready(uid: int):
+    async with pool.acquire() as c:
+        row = await c.fetchrow("SELECT invited_by FROM users WHERE user_id=$1", uid)
+        if not row or not row["invited_by"]:
+            return
+        inviter = row["invited_by"]
+        async with c.transaction():
+            inviter_exists = await c.fetchval("SELECT 1 FROM users WHERE user_id=$1 FOR UPDATE", inviter)
+            if not inviter_exists:
+                return
+            # Insert first; only the transaction that wins the unique constraint credits the balance.
+            inserted = await c.fetchval(
+                "INSERT INTO ledger(user_id,amount,reason,actor_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id",
+                inviter, REFERRAL_REWARD, f"referral:{uid}", uid
+            )
+            if inserted:
+                await c.execute("UPDATE users SET balance=balance+$2,updated_at=NOW() WHERE user_id=$1", inviter, REFERRAL_REWARD)
+
+
+async def callback_user_gate(call: CallbackQuery) -> bool:
+    uid = call.from_user.id
+    row = await user_row(uid)
+    if row and row["locked"] and not is_admin(uid):
+        await call.answer("Tài khoản đang bị khóa.", show_alert=True)
+        return False
+    if await maintenance_on() and not is_admin(uid):
+        await call.answer("Bot đang bảo trì.", show_alert=True)
+        return False
+    missing = await missing_groups(uid)
+    if missing:
+        await call.answer("Bạn cần tham gia lại nhóm.", show_alert=True)
+        await show_verification(call, uid, rejoin=True)
+        return False
+    return True
 
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    user_flows.pop(message.from_user.id, None)
-    await message.answer(
-        "Xin chào! Bot hiện hỗ trợ gửi yêu cầu rút tiền đến Admin.\n\n"
-        "Chọn <b>🏧 Rút tiền</b> để bắt đầu.",
-        reply_markup=main_keyboard(message.from_user.id),
-    )
+    await ensure_user(message.from_user)
+    args = (message.text or "").split(maxsplit=1)
+    inviter = None
+    if len(args) == 2 and args[1].startswith("ref"):
+        raw = args[1][3:]
+        if raw.isdigit() and int(raw) != message.from_user.id:
+            inviter = int(raw)
+    if inviter:
+        async with pool.acquire() as c:
+            await c.execute("UPDATE users SET invited_by=$2 WHERE user_id=$1 AND invited_by IS NULL", message.from_user.id, inviter)
+    await clear_state(message.from_user.id)
+    if not await show_verification(message, message.from_user.id):
+        return
+    await award_referral_if_ready(message.from_user.id)
+    await message.answer("Chào mừng bạn! Chọn chức năng bên dưới.", reply_markup=main_keyboard(message.from_user.id))
+
+
+@dp.callback_query(F.data == "verify")
+async def verify_callback(call: CallbackQuery):
+    await call.answer()
+    await ensure_user(call.from_user)
+    ok = await show_verification(call, call.from_user.id)
+    if ok:
+        await award_referral_if_ready(call.from_user.id)
+
+
+@dp.message(F.text | F.photo)
+async def text_router(message: Message):
+    uid = message.from_user.id
+    await ensure_user(message.from_user)
+    text_in = (message.text or "").strip()
+    if text_in.startswith("/"):
+        return
+    if not is_admin(uid) and not await gate(message):
+        return
+    # The persistent reply-keyboard exit button must be handled before
+    # state-specific input validation (otherwise it is mistaken for an amount).
+    if text_in == EXIT_TEXT:
+        await clear_state(uid)
+        await message.answer("✅ Đã thoát thao tác.", reply_markup=main_keyboard(uid))
+        return
+
+    state = await get_state(uid)
+    if state:
+        st, data = state["state"], state["data"]
+        if st == "withdraw_amount":
+            if not text_in.isdigit() or int(text_in) < MIN_WITHDRAW:
+                await message.answer(f"❌ Số tiền tối thiểu là {MIN_WITHDRAW:,} điểm. Vui lòng nhập lại hoặc bấm nút ❌ Thoát bên dưới.", reply_markup=exit_keyboard())
+                return
+            amount = int(text_in)
+            row = await user_row(uid)
+            if not row or row["balance"] < amount:
+                await message.answer("❌ Số dư không đủ. Vui lòng nhập lại hoặc bấm nút ❌ Thoát bên dưới.", reply_markup=exit_keyboard())
+                return
+            async with pool.acquire() as c:
+                async with c.transaction():
+                    changed = await c.fetchval("UPDATE users SET balance=balance-$2 WHERE user_id=$1 AND balance >= $2 RETURNING user_id", uid, amount)
+                    if not changed:
+                        await message.answer("❌ Số dư không đủ.")
+                        return
+                    wid = await c.fetchval("INSERT INTO withdrawals(user_id,amount) VALUES($1,$2) RETURNING id", uid, amount)
+                    await c.execute("INSERT INTO ledger(user_id,amount,reason,actor_id) VALUES($1,$2,$3,$4)", uid, -amount, f"withdraw_hold:{wid}", uid)
+            await clear_state(uid)
+            await message.answer("Đã nhận số điểm. Chọn xác nhận bên dưới để gửi yêu cầu.", reply_markup=main_keyboard(uid))
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Confirm", callback_data=f"wconfirm:{wid}"), InlineKeyboardButton(text="🚫 Cancel", callback_data=f"wcancel:{wid}")]])
+            await message.answer(f"Bạn có chắc chắn tạo yêu cầu rút: <b>{amount:,} điểm</b>?\n\n❗ Đây là yêu cầu chờ Admin xem xét, không phải lệnh chuyển tiền tự động.", reply_markup=kb)
+            return
+        if st == "admin_lookup":
+            if not text_in.isdigit():
+                await message.answer("Hãy gửi ID Telegram dạng số.")
+                return
+            target = await user_row(int(text_in))
+            await clear_state(uid)
+            if not target:
+                await message.answer("Không tìm thấy người dùng.", reply_markup=admin_keyboard())
+                return
+            uname = f"@{target['username']}" if target["username"] else "(không có username)"
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔒 Khóa", callback_data=f"u:lock:{target['user_id']}"), InlineKeyboardButton(text="🔓 Mở khóa", callback_data=f"u:unlock:{target['user_id']}")],
+                [InlineKeyboardButton(text="➕ Cộng điểm", callback_data=f"u:add:{target['user_id']}"), InlineKeyboardButton(text="➖ Trừ điểm", callback_data=f"u:sub:{target['user_id']}")],
+                [InlineKeyboardButton(text="📩 Lịch sử mời", callback_data=f"u:refs:{target['user_id']}"), InlineKeyboardButton(text="💸 Lịch sử rút", callback_data=f"u:withdraws:{target['user_id']}")]
+            ])
+            await message.answer(f"👤 <b>Thông tin người dùng</b>\nID: <code>{target['user_id']}</code>\nUsername: {uname}\nTên: {target['first_name'] or '-'}\nSố dư: {target['balance']:,} điểm\nKhóa: {'Có' if target['locked'] else 'Không'}\nNgày tạo: {target['created_at']:%d/%m/%Y}", reply_markup=kb)
+            return
+        if st in ("admin_add", "admin_sub"):
+            if not text_in.isdigit() or int(text_in) <= 0:
+                await message.answer("Nhập số điểm nguyên dương.")
+                return
+            target_id = int(data)
+            amount = int(text_in) * (1 if st == "admin_add" else -1)
+            if amount < 0:
+                async with pool.acquire() as c:
+                    bal = await c.fetchval("SELECT balance FROM users WHERE user_id=$1", target_id)
+                if bal is None or bal < -amount:
+                    await message.answer("Số dư người dùng không đủ để trừ.")
+                    return
+            async with pool.acquire() as c:
+                async with c.transaction():
+                    if amount < 0:
+                        changed = await c.fetchval("UPDATE users SET balance=balance+$2,updated_at=NOW() WHERE user_id=$1 AND balance >= $3 RETURNING user_id", target_id, amount, -amount)
+                    else:
+                        changed = await c.fetchval("UPDATE users SET balance=balance+$2,updated_at=NOW() WHERE user_id=$1 RETURNING user_id", target_id, amount)
+                    if not changed:
+                        await message.answer("Không thể cập nhật: người dùng không tồn tại hoặc số dư không đủ.")
+                        return
+                    await c.execute("INSERT INTO ledger(user_id,amount,reason,actor_id) VALUES($1,$2,$3,$4)", target_id, amount, "admin_adjustment", uid)
+            await clear_state(uid)
+            await message.answer("✅ Đã cập nhật số dư.", reply_markup=admin_keyboard())
+            return
+        if st == "admin_broadcast":
+            await clear_state(uid)
+            async with pool.acquire() as c:
+                ids = await c.fetch("SELECT user_id FROM users WHERE locked=FALSE")
+            ok = fail = 0
+            for r in ids:
+                try:
+                    if message.photo:
+                        await bot.send_photo(r["user_id"], message.photo[-1].file_id, caption=message.caption or "")
+                    else:
+                        await bot.send_message(r["user_id"], message.text)
+                    ok += 1
+                    await asyncio.sleep(0.04)
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                    try:
+                        await bot.copy_message(r["user_id"], message.chat.id, message.message_id)
+                        ok += 1
+                    except Exception:
+                        fail += 1
+                except (TelegramForbiddenError, TelegramBadRequest):
+                    fail += 1
+                except Exception:
+                    fail += 1
+                    log.exception("Broadcast failed for %s", r["user_id"])
+            await message.answer(f"📢 Hoàn tất gửi thông báo. Thành công: {ok}, thất bại: {fail}", reply_markup=admin_keyboard())
+            return
+        if st == "group_chat":
+            # Chỉ cần gửi một link nhóm/kênh công khai, ví dụ https://t.me/luxyffshare
+            join_url = text_in.strip()
+            try:
+                match = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})/?(?:\?.*)?$", join_url)
+                if match:
+                    chat_ref = "@" + match.group(1)
+                    if not join_url.startswith(("http://", "https://")):
+                        join_url = "https://" + join_url
+                elif re.fullmatch(r"@[A-Za-z0-9_]{5,}", join_url):
+                    chat_ref = join_url
+                    join_url = "https://t.me/" + join_url[1:]
+                else:
+                    raise ValueError("invalid public Telegram link")
+
+                chat = await bot.get_chat(chat_ref)
+                # Bot cần có quyền xem thành viên (nên đặt bot làm quản trị viên nhóm/kênh).
+                bot_member = await bot.get_chat_member(chat_id=chat.id, user_id=(await bot.get_me()).id)
+                if bot_member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+                    await message.answer("⚠️ Đã tìm thấy nhóm nhưng bot chưa là quản trị viên. Hãy thêm bot làm admin trong nhóm/kênh rồi gửi lại link.")
+                    return
+                async with pool.acquire() as c:
+                    await c.execute("INSERT INTO required_groups(chat_id,title,join_url) VALUES($1,$2,$3) ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title,join_url=EXCLUDED.join_url", str(chat.id), chat.title or chat_ref, join_url)
+                await clear_state(uid)
+                await message.answer(f"✅ Đã thêm nhóm: <b>{chat.title or chat_ref}</b>", reply_markup=admin_keyboard())
+            except Exception as e:
+                log.warning("Group add failed: %s", e)
+                await message.answer("❌ Không thêm được nhóm. Chỉ hỗ trợ link công khai dạng https://t.me/username. Hãy kiểm tra link và thêm bot làm quản trị viên nhóm/kênh.")
+            return
+    if text_in == "🏧 Rút + nạp 🏧":
+        row = await user_row(uid)
+        await set_state(uid, "withdraw_amount")
+        await message.answer(f"✅ Số tiền rút tối thiểu là {MIN_WITHDRAW:,} điểm\n\n🏧 Số dư hiện tại: {row['balance']:,} điểm\nNhập số điểm muốn yêu cầu rút. Muốn dừng, bấm ❌ Thoát bên dưới.", reply_markup=exit_keyboard())
+    elif text_in == "👨‍💼 Cá Nhân 👨‍💼":
+        row = await user_row(uid)
+        await message.answer(f"🏧 Số Dư: <b>{row['balance']:,} điểm</b>\n🆔 ID: <code>{uid}</code>", reply_markup=exit_keyboard())
+    elif text_in == "💌 Mời Bạn bè 💌":
+        me = await bot.get_me()
+        async with pool.acquire() as c:
+            invited = await c.fetchval("SELECT COUNT(*) FROM users WHERE invited_by=$1 AND verified=TRUE", uid)
+        link = f"https://t.me/{me.username}?start=ref{uid}"
+        await message.answer(f"💌 Mời bạn bè\n\nMời 1 người tham gia hợp lệ\n🏧 Bạn nhận {REFERRAL_REWARD:,} điểm\n\nLink giới thiệu của bạn:\n{link}\n\nSố lượt hợp lệ: {invited}")
+    elif text_in == "🛠 Admin" and is_admin(uid):
+        await message.answer("🛠 <b>BẢNG ĐIỀU KHIỂN ADMIN</b>", reply_markup=admin_keyboard())
 
 
 @dp.message(Command("cancel"))
-async def cancel_command(message: Message):
-    user_flows.pop(message.from_user.id, None)
+async def cancel(message: Message):
+    await clear_state(message.from_user.id)
     await message.answer("Đã hủy thao tác.", reply_markup=main_keyboard(message.from_user.id))
 
 
-@dp.message(F.text == CANCEL_BUTTON)
-async def cancel_button(message: Message):
-    user_flows.pop(message.from_user.id, None)
-    await message.answer("Đã hủy thao tác.", reply_markup=main_keyboard(message.from_user.id))
-
-
-@dp.message(F.text == WITHDRAW_BUTTON)
-async def begin_withdrawal(message: Message):
-    user_flows[message.from_user.id] = {"step": "amount", "draft": {}}
-    await message.answer(
-        f"💸 Nhập số tiền bạn muốn rút (tối thiểu {MIN_WITHDRAW:,}).\n"
-        "Bot không lưu số dư; yêu cầu sẽ được gửi Admin để kiểm tra.",
-        reply_markup=cancel_keyboard(),
-    )
-
-
-@dp.message(F.text == ADMIN_BUTTON)
-async def admin_panel(message: Message):
-    if not is_admin(message.from_user.id):
+@dp.callback_query(F.data.startswith("wconfirm:"))
+async def withdrawal_confirm(call: CallbackQuery):
+    if not await callback_user_gate(call):
         return
-    active = len(pending_requests)
-    await message.answer(
-        "🛠 <b>BẢNG ADMIN</b>\n"
-        f"Yêu cầu đang chờ trong phiên chạy hiện tại: <b>{active}</b>\n\n"
-        "Yêu cầu rút mới sẽ được gửi trực tiếp vào cuộc trò chuyện này."
-    )
-
-
-@dp.message(F.text)
-async def collect_withdrawal_details(message: Message):
-    uid = message.from_user.id
-    text = (message.text or "").strip()
-    if text.startswith("/"):
-        return
-
-    flow = user_flows.get(uid)
-    if not flow:
-        if text not in (WITHDRAW_BUTTON, ADMIN_BUTTON, CANCEL_BUTTON):
-            await message.answer("Chọn 🏧 Rút tiền trên menu để bắt đầu.", reply_markup=main_keyboard(uid))
-        return
-
-    step = flow["step"]
-    draft = flow["draft"]
-
-    if step == "amount":
-        normalized = text.replace(",", "").replace(".", "").replace(" ", "")
-        if not normalized.isdigit() or int(normalized) < MIN_WITHDRAW:
-            await message.answer(f"❌ Số tiền không hợp lệ. Nhập số nguyên từ {MIN_WITHDRAW:,} trở lên.", reply_markup=cancel_keyboard())
-            return
-        draft["amount"] = int(normalized)
-        flow["step"] = "bank_account"
-        await message.answer("🏦 Vui lòng nhập <b>số tài khoản ngân hàng</b>:", reply_markup=cancel_keyboard())
-        return
-
-    if step == "bank_account":
-        account = re.sub(r"\s+", "", text)
-        if not re.fullmatch(r"[0-9]{6,25}", account):
-            await message.answer("❌ Số tài khoản chưa hợp lệ. Hãy nhập từ 6 đến 25 chữ số.", reply_markup=cancel_keyboard())
-            return
-        draft["bank_account"] = account
-        flow["step"] = "bank_name"
-        await message.answer("🏦 Tiếp theo, vui lòng nhập <b>tên ngân hàng</b>:", reply_markup=cancel_keyboard())
-        return
-
-    if step == "bank_name":
-        if len(text) < 2 or len(text) > 60:
-            await message.answer("❌ Tên ngân hàng không hợp lệ. Vui lòng nhập lại.", reply_markup=cancel_keyboard())
-            return
-        draft["bank_name"] = text
-        flow["step"] = "account_holder"
-        await message.answer("👤 Vui lòng nhập <b>tên chủ tài khoản</b> đúng như đăng ký tại ngân hàng:", reply_markup=cancel_keyboard())
-        return
-
-    if step == "account_holder":
-        if len(text) < 2 or len(text) > 100:
-            await message.answer("❌ Tên chủ tài khoản không hợp lệ. Vui lòng nhập lại.", reply_markup=cancel_keyboard())
-            return
-        draft["account_holder"] = text
-        request_id = next(request_counter)
-        draft["request_id"] = request_id
-        draft["user_id"] = uid
-        draft["username"] = message.from_user.username or "Không có username"
-        draft["full_name"] = message.from_user.full_name or "Không rõ"
-        flow["step"] = "confirm"
-        flow["draft"] = draft
-        safe_bank = html.escape(draft["bank_name"])
-        safe_holder = html.escape(draft["account_holder"])
-        await message.answer(
-            "📋 <b>XÁC NHẬN YÊU CẦU RÚT TIỀN</b>\n━━━━━━━━━━━━━━━━━━"
-            f"\nSố tiền: <b>{draft['amount']:,}</b>"
-            f"\nSố tài khoản: <code>{draft['bank_account']}</code>"
-            f"\nNgân hàng: <b>{safe_bank}</b>"
-            f"\nChủ tài khoản: <b>{safe_holder}</b>"
-            "\n\nKiểm tra kỹ thông tin trước khi gửi Admin.",
-            reply_markup=confirmation_keyboard(request_id),
-        )
-
-
-@dp.callback_query(F.data.startswith("userconfirm:"))
-async def confirm_withdrawal(call: CallbackQuery):
-    uid = call.from_user.id
-    try:
-        request_id = int(call.data.split(":", 1)[1])
-    except (ValueError, IndexError):
-        await call.answer("Yêu cầu không hợp lệ.", show_alert=True)
-        return
-
-    flow = user_flows.get(uid)
-    if not flow or flow.get("step") != "confirm" or flow["draft"].get("request_id") != request_id:
-        await call.answer("Yêu cầu đã hết hạn. Hãy bắt đầu lại.", show_alert=True)
-        return
-
-    draft = dict(flow["draft"])
-    pending_requests[request_id] = draft
-    user_flows.pop(uid, None)
-
-    username = f"@{html.escape(draft['username'])}" if draft["username"] != "Không có username" else "Không có username"
-    admin_text = (
-        f"💸 <b>YÊU CẦU RÚT TIỀN #{request_id}</b>\n━━━━━━━━━━━━━━━━━━"
-        f"\nNgười dùng: <code>{uid}</code>"
-        f"\nTên: {html.escape(draft['full_name'])}"
-        f"\nUsername: {username}"
-        f"\nSố tiền: <b>{draft['amount']:,}</b>"
-        f"\nSố tài khoản: <code>{draft['bank_account']}</code>"
-        f"\nNgân hàng: <b>{html.escape(draft['bank_name'])}</b>"
-        f"\nChủ tài khoản: <b>{html.escape(draft['account_holder'])}</b>"
-        "\nTrạng thái: <b>Chờ Admin xử lý</b>"
-    )
-
-    sent = 0
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, admin_text, reply_markup=admin_decision_keyboard(request_id))
-            sent += 1
-        except (TelegramForbiddenError, TelegramBadRequest):
-            log.exception("Cannot send withdrawal request to admin %s", admin_id)
-        except Exception:
-            log.exception("Unexpected error notifying admin %s", admin_id)
-
     await call.answer()
-    if sent:
-        await call.message.edit_text("✅ Đã gửi yêu cầu rút tiền đến Admin. Vui lòng chờ phản hồi.")
-        await call.message.answer("Bạn có thể quay lại menu.", reply_markup=main_keyboard(uid))
-    else:
-        pending_requests.pop(request_id, None)
-        await call.message.edit_text("❌ Chưa gửi được yêu cầu đến Admin. Vui lòng báo Admin kiểm tra bot đã được mở chat chưa.")
-        await call.message.answer("Chọn lại chức năng khi cần.", reply_markup=main_keyboard(uid))
+    wid = int(call.data.split(":")[1])
+    async with pool.acquire() as c:
+        row = await c.fetchrow("SELECT w.*,u.username FROM withdrawals w JOIN users u USING(user_id) WHERE w.id=$1", wid)
+    if not row or row["user_id"] != call.from_user.id or row["status"] != "pending":
+        await call.message.answer("Yêu cầu không còn hợp lệ.")
+        return
+    async with pool.acquire() as c:
+        await c.execute("UPDATE withdrawals SET status='awaiting_admin' WHERE id=$1 AND status='pending'", wid)
+    for aid in ADMIN_IDS:
+        uname = f"@{row['username']}" if row["username"] else "Không có username"
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Duyệt", callback_data=f"wd:approve:{wid}"), InlineKeyboardButton(text="❌ Từ chối", callback_data=f"wd:reject:{wid}")]])
+        try:
+            await bot.send_message(aid, f"💸 <b>YÊU CẦU RÚT #{wid}</b>\nID: <code>{row['user_id']}</code>\nUsername: {uname}\nSố điểm: <b>{row['amount']:,}</b>\nTrạng thái: Chờ duyệt", reply_markup=kb)
+        except Exception:
+            log.exception("Cannot notify admin %s", aid)
+    await call.message.edit_text("✅ Đã gửi yêu cầu đến Admin. Đây chưa phải xác nhận chuyển tiền.")
 
 
-@dp.callback_query(F.data.startswith("usercancel:"))
-async def cancel_withdrawal_confirmation(call: CallbackQuery):
-    uid = call.from_user.id
-    user_flows.pop(uid, None)
-    await call.answer("Đã hủy yêu cầu.")
-    await call.message.edit_text("🚫 Đã hủy yêu cầu rút tiền. Chưa gửi thông tin cho Admin.")
-    await call.message.answer("Chọn chức năng bên dưới.", reply_markup=main_keyboard(uid))
+@dp.callback_query(F.data.startswith("wcancel:"))
+async def withdrawal_cancel(call: CallbackQuery):
+    if not await callback_user_gate(call):
+        return
+    await call.answer()
+    wid = int(call.data.split(":")[1])
+    async with pool.acquire() as c:
+        async with c.transaction():
+            row = await c.fetchrow("SELECT * FROM withdrawals WHERE id=$1 FOR UPDATE", wid)
+            if not row or row["user_id"] != call.from_user.id or row["status"] not in ("pending", "awaiting_admin"):
+                await call.message.answer("Không thể hủy yêu cầu này.")
+                return
+            await c.execute("UPDATE withdrawals SET status='cancelled',decided_at=NOW() WHERE id=$1", wid)
+            await c.execute("UPDATE users SET balance=balance+$2 WHERE user_id=$1", row["user_id"], row["amount"])
+            await c.execute("INSERT INTO ledger(user_id,amount,reason,actor_id) VALUES($1,$2,$3,$4)", row["user_id"], row["amount"], f"withdraw_cancel:{wid}", call.from_user.id)
+    await call.message.edit_text("🚫 Đã hủy yêu cầu. Điểm đã được hoàn lại.")
 
 
-@dp.callback_query(F.data.startswith("adminapprove:") | F.data.startswith("adminreject:"))
-async def admin_decision(call: CallbackQuery):
+@dp.callback_query(F.data.startswith("wd:"))
+async def admin_withdraw_decision(call: CallbackQuery):
     if not is_admin(call.from_user.id):
-        await call.answer("Bạn không có quyền Admin.", show_alert=True)
-        return
+        await call.answer("Không có quyền.", show_alert=True); return
+    _, action, wid_s = call.data.split(":")
+    wid = int(wid_s)
+    async with pool.acquire() as c:
+        async with c.transaction():
+            row = await c.fetchrow("SELECT * FROM withdrawals WHERE id=$1 FOR UPDATE", wid)
+            if not row or row["status"] != "awaiting_admin":
+                await call.answer("Yêu cầu đã được xử lý.", show_alert=True); return
+            status = "approved" if action == "approve" else "rejected"
+            await c.execute("UPDATE withdrawals SET status=$2,decided_at=NOW(),decided_by=$3 WHERE id=$1", wid, status, call.from_user.id)
+            if status == "rejected":
+                await c.execute("UPDATE users SET balance=balance+$2 WHERE user_id=$1", row["user_id"], row["amount"])
+                await c.execute("INSERT INTO ledger(user_id,amount,reason,actor_id) VALUES($1,$2,$3,$4)", row["user_id"], row["amount"], f"withdraw_rejected:{wid}", call.from_user.id)
+    await call.answer("Đã xử lý.")
+    await call.message.edit_text(f"Yêu cầu #{wid}: {'ĐÃ DUYỆT' if status == 'approved' else 'ĐÃ TỪ CHỐI'}")
+    if status == "approved":
+        await bot.send_message(row["user_id"], f"📢 <b>THÔNG BÁO RÚT THÀNH CÔNG</b>\n━━━━━━━━━━━━━━━━━━\n✅ Yêu cầu #{wid} đã được Admin duyệt. Việc chuyển tiền cần được thực hiện riêng ngoài bot.")
+        # Broadcast status notice without claiming an automatic bank transfer.
+        async with pool.acquire() as c:
+            ids = await c.fetch("SELECT user_id FROM users WHERE locked=FALSE")
+        for r in ids:
+            try:
+                await bot.send_message(r["user_id"], f"📢 <b>THÔNG BÁO RÚT THÀNH CÔNG</b>\n━━━━━━━━━━━━━━━━━━\n✅ Một yêu cầu rút điểm đã được Admin duyệt.")
+                await asyncio.sleep(0.04)
+            except Exception:
+                pass
+    else:
+        await bot.send_message(row["user_id"], f"❌ Yêu cầu rút #{wid} bị từ chối. Điểm đã được hoàn lại.")
 
-    action, request_id_text = call.data.split(":", 1)
-    try:
-        request_id = int(request_id_text)
-    except ValueError:
-        await call.answer("Mã yêu cầu không hợp lệ.", show_alert=True)
-        return
 
-    request = pending_requests.pop(request_id, None)
-    if not request:
-        await call.answer("Yêu cầu không còn trong bộ nhớ bot. Có thể bot vừa khởi động lại.", show_alert=True)
-        return
+@dp.callback_query(F.data.startswith("adm:"))
+async def admin_actions(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Không có quyền.", show_alert=True); return
+    action = call.data.split(":", 1)[1]
+    await call.answer()
+    if action == "user":
+        await set_state(call.from_user.id, "admin_lookup")
+        await call.message.answer("Gửi ID Telegram người dùng cần kiểm tra.")
+    elif action == "stats":
+        async with pool.acquire() as c:
+            total, locked, bal, pending, approved = await c.fetchrow("""SELECT
+              (SELECT COUNT(*) FROM users), (SELECT COUNT(*) FROM users WHERE locked),
+              (SELECT COALESCE(SUM(balance),0) FROM users),
+              (SELECT COUNT(*) FROM withdrawals WHERE status='awaiting_admin'),
+              (SELECT COUNT(*) FROM withdrawals WHERE status='approved')""")
+        await call.message.answer(f"📊 <b>THỐNG KÊ</b>\nNgười dùng: {total}\nĐang khóa: {locked}\nTổng số dư: {bal:,} điểm\nYêu cầu chờ duyệt: {pending}\nĐã duyệt: {approved}")
+    elif action == "broadcast":
+        await set_state(call.from_user.id, "admin_broadcast")
+        await call.message.answer("Gửi nội dung hoặc ảnh kèm chú thích để phát cho tất cả người dùng. Gửi một tin nhắn duy nhất.")
+    elif action == "withdrawals":
+        async with pool.acquire() as c:
+            rows = await c.fetch("SELECT id,user_id,amount,created_at FROM withdrawals WHERE status='awaiting_admin' ORDER BY created_at DESC LIMIT 20")
+        if not rows:
+            await call.message.answer("Không có yêu cầu đang chờ.")
+        for r in rows:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Duyệt", callback_data=f"wd:approve:{r['id']}"), InlineKeyboardButton(text="❌ Từ chối", callback_data=f"wd:reject:{r['id']}")]])
+            await call.message.answer(f"#{r['id']} | ID {r['user_id']} | {r['amount']:,} điểm", reply_markup=kb)
+    elif action == "groups":
+        await call.message.answer("Quản lý nhóm:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Thêm nhóm", callback_data="grp:add")],
+            [InlineKeyboardButton(text="📋 Danh sách nhóm", callback_data="grp:list")]
+        ]))
+    elif action == "maintenance":
+        cur = await maintenance_on()
+        new = "0" if cur else "1"
+        async with pool.acquire() as c:
+            await c.execute("UPDATE settings SET value=$1 WHERE key='maintenance'", new)
+        await call.message.answer(f"🛠 Đã {'TẮT' if cur else 'BẬT'} chế độ bảo trì.")
 
-    approved = action == "adminapprove"
-    result_text = "✅ Admin đã duyệt yêu cầu rút tiền của bạn." if approved else "❌ Admin đã từ chối yêu cầu rút tiền của bạn."
-    try:
-        await bot.send_message(request["user_id"], result_text)
-    except Exception:
-        log.exception("Cannot notify user %s about decision", request["user_id"])
 
-    await call.answer("Đã ghi nhận quyết định.")
-    status = "ĐÃ DUYỆT" if approved else "ĐÃ TỪ CHỐI"
-    await call.message.edit_text(call.message.text + f"\n\n<b>Trạng thái: {status}</b>\nAdmin: <code>{call.from_user.id}</code>")
+@dp.callback_query(F.data.startswith("grp:"))
+async def group_actions(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Không có quyền.", show_alert=True); return
+    await call.answer()
+    action = call.data.split(":", 1)[1]
+    if action == "add":
+        await set_state(call.from_user.id, "group_chat")
+        await call.message.answer("Chỉ cần gửi link nhóm/kênh công khai, ví dụ: <code>https://t.me/luxyffshare</code>. Bot phải là quản trị viên nhóm/kênh để kiểm tra thành viên.")
+    elif action == "list":
+        async with pool.acquire() as c:
+            groups = await c.fetch("SELECT * FROM required_groups ORDER BY id")
+        if not groups:
+            await call.message.answer("Chưa có nhóm bắt buộc.")
+        for g in groups:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🗑 Xóa nhóm", callback_data=f"grp:del:{g['id']}")]])
+            await call.message.answer(f"{g['title']}\nID: <code>{g['chat_id']}</code>\n{g['join_url']}", reply_markup=kb)
+    elif action.startswith("del:"):
+        gid = int(action.split(":")[1])
+        async with pool.acquire() as c:
+            await c.execute("DELETE FROM required_groups WHERE id=$1", gid)
+        await call.message.answer("✅ Đã xóa nhóm.")
+
+
+@dp.callback_query(F.data.startswith("u:"))
+async def user_admin_actions(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Không có quyền.", show_alert=True); return
+    _, action, uid_s = call.data.split(":")
+    uid = int(uid_s)
+    await call.answer()
+    if action in ("lock", "unlock"):
+        async with pool.acquire() as c:
+            await c.execute("UPDATE users SET locked=$2 WHERE user_id=$1", uid, action == "lock")
+        await call.message.answer("✅ Đã cập nhật trạng thái khóa.")
+    elif action in ("add", "sub"):
+        await set_state(call.from_user.id, "admin_add" if action == "add" else "admin_sub", str(uid))
+        await call.message.answer("Nhập số điểm cần điều chỉnh.")
+    elif action in ("refs", "withdraws"):
+        async with pool.acquire() as c:
+            if action == "refs":
+                rows = await c.fetch("SELECT user_id,created_at FROM users WHERE invited_by=$1 ORDER BY created_at DESC LIMIT 20", uid)
+                body = "📩 <b>LỊCH SỬ MỜI</b>\n" + ("\n".join(f"ID {r['user_id']} — {r['created_at']:%d/%m %H:%M}" for r in rows) or "Chưa có lượt mời.")
+            else:
+                rows = await c.fetch("SELECT id,amount,status,created_at FROM withdrawals WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20", uid)
+                body = "💸 <b>LỊCH SỬ RÚT</b>\n" + ("\n".join(f"#{r['id']} — {r['amount']:,} — {r['status']} — {r['created_at']:%d/%m %H:%M}" for r in rows) or "Chưa có yêu cầu rút.")
+        await call.message.answer(body)
 
 
 async def main():
+    await init_db()
     me = await bot.get_me()
-    log.info("Bot started as @%s (no database mode)", me.username)
+    log.info("Bot started as @%s", me.username)
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        if pool:
+            await pool.close()
         await bot.session.close()
 
 
