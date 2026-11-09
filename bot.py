@@ -119,7 +119,41 @@ async def init_db():
     dsn = DATABASE_URL
     if dsn.startswith("postgres://"):
         dsn = "postgresql://" + dsn[len("postgres://"):]
-    pg = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=int(os.getenv("DB_POOL_SIZE", "10")), command_timeout=60)
+
+    # Supabase requires TLS. Its direct database hostname may be IPv6-only;
+    # on Railway use the Supabase Session/Shared Pooler URL (IPv4) instead.
+    db_host = dsn.split("@", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
+    ssl_setting = "require" if ("supabase.co" in db_host or "pooler.supabase.com" in db_host) else None
+    pool_size = max(1, min(int(os.getenv("DB_POOL_SIZE", "5")), 20))
+
+    # Retry temporary database/network startup failures instead of crashing
+    # immediately while Railway/Supabase is waking up.
+    last_error = None
+    for attempt in range(1, 9):
+        try:
+            pg = await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=pool_size,
+                command_timeout=60,
+                timeout=20,
+                ssl=ssl_setting,
+            )
+            break
+        except (OSError, asyncpg.PostgresError, asyncio.TimeoutError) as exc:
+            last_error = exc
+            log.warning("Database connection attempt %s/8 failed: %s", attempt, type(exc).__name__)
+            if attempt < 8:
+                await asyncio.sleep(min(attempt * 3, 20))
+    else:
+        raise RuntimeError(
+            "Không kết nối được PostgreSQL sau 8 lần thử. "
+            "Hãy kiểm tra DATABASE_URL trong Railway. Nếu dùng Supabase, "
+            "hãy dùng URL Session/Shared Pooler (host dạng *.pooler.supabase.com), "
+            "không dùng hostname db.<project>.supabase.co trực tiếp. "
+            f"Lỗi cuối: {type(last_error).__name__}"
+        ) from last_error
+
     pool = PgPool(pg)
     async with pool.acquire() as c:
         await c.execute("""
