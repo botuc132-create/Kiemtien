@@ -194,6 +194,11 @@ async def init_db():
         ALTER TABLE users ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
         ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+        -- Older schema may require joined_at without defining a default.
+        -- Give both existing and future rows a safe timestamp without deleting data.
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ DEFAULT NOW();
+        ALTER TABLE users ALTER COLUMN joined_at SET DEFAULT NOW();
+        UPDATE users SET joined_at = COALESCE(created_at, NOW()) WHERE joined_at IS NULL;
 
         ALTER TABLE required_groups ADD COLUMN IF NOT EXISTS chat_id TEXT;
         ALTER TABLE required_groups ADD COLUMN IF NOT EXISTS title TEXT;
@@ -233,8 +238,13 @@ async def clear_state(uid: int):
 
 async def ensure_user(user):
     async with pool.acquire() as c:
-        await c.execute("""INSERT INTO users(user_id,username,first_name) VALUES($1,$2,$3)
-        ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, updated_at=NOW()""",
+        # joined_at is included explicitly for compatibility with older Supabase schemas.
+        await c.execute("""INSERT INTO users(user_id,username,first_name,joined_at)
+        VALUES($1,$2,$3,NOW())
+        ON CONFLICT(user_id) DO UPDATE SET
+          username=EXCLUDED.username,
+          first_name=EXCLUDED.first_name,
+          updated_at=NOW()""",
                         user.id, user.username, user.first_name)
 
 async def user_row(uid: int):
