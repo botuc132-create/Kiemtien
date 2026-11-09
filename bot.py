@@ -152,6 +152,7 @@ async def init_db():
           user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
           balance INTEGER NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0,
           invited_by INTEGER, verified INTEGER NOT NULL DEFAULT 0,
+          bank_info TEXT,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS required_groups (
@@ -174,6 +175,11 @@ async def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_referral_once ON ledger(user_id, reason) WHERE reason LIKE 'referral:%';
         CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id, created_at DESC);
         """)
+        # Đảm bảo bảng users có cột bank_info nếu database cũ chưa có
+        try:
+            await c.execute("ALTER TABLE users ADD COLUMN bank_info TEXT")
+        except Exception:
+            pass
         await c.execute("INSERT INTO settings(key,value) VALUES('maintenance','0') ON CONFLICT(key) DO NOTHING")
     log.info("Local SQLite database ready: %s", DB_PATH)
 
@@ -264,13 +270,6 @@ async def gate(message: Message) -> bool:
         return False
     return True
 
-async def credit(uid: int, amount: int, reason: str, actor: int):
-    async with pool.acquire() as c:
-        async with c.transaction():
-            await c.execute("UPDATE users SET balance=balance+$2,updated_at=NOW() WHERE user_id=$1", uid, amount)
-            await c.execute("INSERT INTO ledger(user_id,amount,reason,actor_id) VALUES($1,$2,$3,$4)", uid, amount, reason, actor)
-
-
 async def award_referral_if_ready(uid: int):
     async with pool.acquire() as c:
         row = await c.fetchrow("SELECT invited_by FROM users WHERE user_id=$1", uid)
@@ -281,15 +280,12 @@ async def award_referral_if_ready(uid: int):
             inviter_exists = await c.fetchval("SELECT 1 FROM users WHERE user_id=$1 FOR UPDATE", inviter)
             if not inviter_exists:
                 return
-            # Insert first; only the transaction that wins the unique constraint credits the balance.
             inserted = await c.fetchval(
                 "INSERT INTO ledger(user_id,amount,reason,actor_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id",
                 inviter, REFERRAL_REWARD, f"referral:{uid}", uid
             )
             if inserted:
                 await c.execute("UPDATE users SET balance=balance+$2,updated_at=NOW() WHERE user_id=$1", inviter, REFERRAL_REWARD)
-                
-                # Gửi thông báo cho người mời
                 try:
                     await bot.send_message(
                         inviter, 
@@ -363,6 +359,15 @@ async def text_router(message: Message):
     state = await get_state(uid)
     if state:
         st, data = state["state"], state["data"]
+        if st == "bank_setup":
+            if "|" not in text_in:
+                await message.answer("❌ Định dạng không đúng. Vui lòng nhập theo mẫu:\n<code>tenbank| sotaikhoan| tentaikhoan</code>\nHoặc bấm ❌ Thoát bên dưới.", reply_markup=exit_keyboard())
+                return
+            async with pool.acquire() as c:
+                await c.execute("UPDATE users SET bank_info=$2, updated_at=NOW() WHERE user_id=$1", uid, text_in)
+            await clear_state(uid)
+            await message.answer(f"✅ Đã lưu thông tin ngân hàng:\n<code>{text_in}</code>\n\nBây giờ bạn có thể bấm lại nút <b>🏧 Rút + nạp 🏧</b> để tiến hành tạo lệnh rút.", reply_markup=main_keyboard(uid))
+            return
         if st == "withdraw_amount":
             if not text_in.isdigit() or int(text_in) < MIN_WITHDRAW:
                 await message.answer(f"❌ Số tiền tối thiểu là {MIN_WITHDRAW:,} điểm. Vui lòng nhập lại hoặc bấm nút ❌ Thoát bên dưới.", reply_markup=exit_keyboard())
@@ -395,12 +400,13 @@ async def text_router(message: Message):
                 await message.answer("Không tìm thấy người dùng.", reply_markup=admin_keyboard())
                 return
             uname = f"@{target['username']}" if target["username"] else "(không có username)"
+            bank_str = target['bank_info'] or 'Chưa cập nhật'
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔒 Khóa", callback_data=f"u:lock:{target['user_id']}"), InlineKeyboardButton(text="🔓 Mở khóa", callback_data=f"u:unlock:{target['user_id']}")],
                 [InlineKeyboardButton(text="➕ Cộng điểm", callback_data=f"u:add:{target['user_id']}"), InlineKeyboardButton(text="➖ Trừ điểm", callback_data=f"u:sub:{target['user_id']}")],
                 [InlineKeyboardButton(text="📩 Lịch sử mời", callback_data=f"u:refs:{target['user_id']}"), InlineKeyboardButton(text="💸 Lịch sử rút", callback_data=f"u:withdraws:{target['user_id']}")]
             ])
-            await message.answer(f"👤 <b>Thông tin người dùng</b>\nID: <code>{target['user_id']}</code>\nUsername: {uname}\nTên: {target['first_name'] or '-'}\nSố dư: {target['balance']:,} điểm\nKhóa: {'Có' if target['locked'] else 'Không'}\nNgày tạo: {target['created_at']:%d/%m/%Y}", reply_markup=kb)
+            await message.answer(f"👤 <b>Thông tin người dùng</b>\nID: <code>{target['user_id']}</code>\nUsername: {uname}\nTên: {target['first_name'] or '-'}\nSố dư: {target['balance']:,} điểm\nNgân hàng: <code>{bank_str}</code>\nKhóa: {'Có' if target['locked'] else 'Không'}\nNgày tạo: {target['created_at']:%d/%m/%Y}", reply_markup=kb)
             return
         if st in ("admin_add", "admin_sub"):
             if not text_in.isdigit() or int(text_in) <= 0:
@@ -481,13 +487,34 @@ async def text_router(message: Message):
                 log.warning("Group add failed: %s", e)
                 await message.answer("❌ Không thêm được nhóm. Chỉ hỗ trợ link công khai dạng https://t.me/username. Hãy kiểm tra link và thêm bot làm quản trị viên nhóm/kênh.")
             return
+
     if text_in == "🏧 Rút + nạp 🏧":
         row = await user_row(uid)
+        # Kiểm tra nếu số dư chưa đạt tối thiểu 33,000 điểm
+        if row['balance'] < MIN_WITHDRAW:
+            await message.answer(f"❌ Số dư hiện tại của bạn là {row['balance']:,} điểm. Cần đạt tối thiểu từ {MIN_WITHDRAW:,} điểm trở lên mới có thể tạo lệnh rút tiền.", reply_markup=main_keyboard(uid))
+            return
+        
+        # Kiểm tra xem người dùng đã cập nhật thông tin ngân hàng chưa
+        if not row['bank_info']:
+            await set_state(uid, "bank_setup")
+            await message.answer(
+                "🏦 <b>CHƯA CÓ THÔNG TIN NGÂN HÀNG</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "Vui lòng gửi thông tin ngân hàng của bạn theo cú pháp:\n\n"
+                "<code>tenbank| sotaikhoan| tentaikhoan</code>\n\n"
+                "<i>Ví dụ: VCB| 0123456789| NGUYEN VAN A</i>\n\n"
+                "Hoặc bấm ❌ Thoát bên dưới để hủy.",
+                reply_markup=exit_keyboard()
+            )
+            return
+
         await set_state(uid, "withdraw_amount")
         await message.answer(f"✅ Số tiền rút tối thiểu là {MIN_WITHDRAW:,} điểm\n\n🏧 Số dư hiện tại: {row['balance']:,} điểm\nNhập số điểm muốn yêu cầu rút. Muốn dừng, bấm ❌ Thoát bên dưới.", reply_markup=exit_keyboard())
     elif text_in == "👨‍💼 Cá Nhân 👨‍💼":
         row = await user_row(uid)
-        await message.answer(f"🏧 Số Dư: <b>{row['balance']:,} điểm</b>\n🆔 ID: <code>{uid}</code>", reply_markup=exit_keyboard())
+        bank_str = row['bank_info'] or 'Chưa cập nhật'
+        await message.answer(f"🏧 Số Dư: <b>{row['balance']:,} điểm</b>\n🆔 ID: <code>{uid}</code>\n🏦 Ngân hàng: <code>{bank_str}</code>", reply_markup=main_keyboard(uid))
     elif text_in == "💌 Mời Bạn bè 💌":
         me = await bot.get_me()
         async with pool.acquire() as c:
@@ -511,20 +538,31 @@ async def withdrawal_confirm(call: CallbackQuery):
     await call.answer()
     wid = int(call.data.split(":")[1])
     async with pool.acquire() as c:
-        row = await c.fetchrow("SELECT w.*,u.username FROM withdrawals w JOIN users u USING(user_id) WHERE w.id=$1", wid)
+        row = await c.fetchrow("SELECT w.*,u.username,u.bank_info FROM withdrawals w JOIN users u USING(user_id) WHERE w.id=$1", wid)
     if not row or row["user_id"] != call.from_user.id or row["status"] != "pending":
         await call.message.answer("Yêu cầu không còn hợp lệ.")
         return
     async with pool.acquire() as c:
         await c.execute("UPDATE withdrawals SET status='awaiting_admin' WHERE id=$1 AND status='pending'", wid)
+    
+    bank_info = row['bank_info'] or "Chưa cung cấp"
     for aid in ADMIN_IDS:
         uname = f"@{row['username']}" if row["username"] else "Không có username"
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Duyệt", callback_data=f"wd:approve:{wid}"), InlineKeyboardButton(text="❌ Từ chối", callback_data=f"wd:reject:{wid}")]])
         try:
-            await bot.send_message(aid, f"💸 <b>YÊU CẦU RÚT #{wid}</b>\nID: <code>{row['user_id']}</code>\nUsername: {uname}\nSố điểm: <b>{row['amount']:,}</b>\nTrạng thái: Chờ duyệt", reply_markup=kb)
+            await bot.send_message(
+                aid, 
+                f"💸 <b>YÊU CẦU RÚT #{wid}</b>\n"
+                f"ID: <code>{row['user_id']}</code>\n"
+                f"Username: {uname}\n"
+                f"Số điểm: <b>{row['amount']:,}</b>\n"
+                f"🏦 Ngân hàng: <code>{bank_info}</code>\n"
+                f"Trạng thái: Chờ duyệt", 
+                reply_markup=kb
+            )
         except Exception:
             log.exception("Cannot notify admin %s", aid)
-    await call.message.edit_text("✅ Đã gửi yêu cầu đến Admin. Đây chưa phải xác nhận chuyển tiền.")
+    await call.message.edit_text("✅ Đã gửi yêu cầu đến Admin kèm thông tin ngân hàng. Đây chưa phải xác nhận chuyển tiền.")
 
 
 @dp.callback_query(F.data.startswith("wcancel:"))
