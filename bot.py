@@ -183,6 +183,37 @@ async def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_referral_once ON ledger(user_id, reason) WHERE reason LIKE 'referral:%';
         CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id, created_at DESC);
         """)
+        # Safe migrations for databases created by an older bot version.
+        # CREATE TABLE IF NOT EXISTS does not add columns to an existing table.
+        await c.execute("""
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS balance BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS invited_by BIGINT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+        ALTER TABLE required_groups ADD COLUMN IF NOT EXISTS chat_id TEXT;
+        ALTER TABLE required_groups ADD COLUMN IF NOT EXISTS title TEXT;
+        ALTER TABLE required_groups ADD COLUMN IF NOT EXISTS join_url TEXT;
+        ALTER TABLE required_groups ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+        ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS amount BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+        ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+        ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
+        ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS decided_by BIGINT;
+
+        ALTER TABLE ledger ADD COLUMN IF NOT EXISTS amount BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE ledger ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
+        ALTER TABLE ledger ADD COLUMN IF NOT EXISTS actor_id BIGINT;
+        ALTER TABLE ledger ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+        ALTER TABLE user_state ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT '';
+        ALTER TABLE user_state ADD COLUMN IF NOT EXISTS data TEXT NOT NULL DEFAULT '';
+        """)
         await c.execute("INSERT INTO settings(key,value) VALUES('maintenance','0') ON CONFLICT(key) DO NOTHING")
     log.info("PostgreSQL database ready")
 

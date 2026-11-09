@@ -23,3 +23,7 @@ Set `BOT_TOKEN`, `ADMIN_IDS`, and `DATABASE_URL`, install `requirements.txt`, th
 Nếu dùng Supabase, không dùng hostname direct `db.<project-ref>.supabase.co` trên Railway khi kết nối IPv6 không được hỗ trợ. Trong Supabase mở **Connect → Session pooler** (hoặc Shared Pooler), sao chép URI dạng `postgresql://...@aws-0-...pooler.supabase.com:5432/postgres` và đặt toàn bộ URI đó vào Railway → bot service → Variables → `DATABASE_URL`. Không tự thêm dấu ngoặc kép. Dùng cổng Session Pooler được Supabase hiển thị; tránh Transaction Pooler `6543` nếu cấu hình ứng dụng không tương thích. Giữ nguyên tên biến `BOT_TOKEN` và `ADMIN_IDS`. Sau đó Redeploy.
 
 Bản cập nhật có retry khi PostgreSQL khởi động chậm và tự bật SSL cho Supabase. Retry không thể khắc phục URL sai hoặc máy chủ không thể truy cập; khi đó cần thay `DATABASE_URL` bằng đúng Pooler URI.
+
+
+## Existing Supabase schema
+On startup, the bot now applies additive `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migrations for columns used by the current code. Existing rows are retained; do not delete or recreate the Supabase tables.
