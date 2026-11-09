@@ -175,7 +175,6 @@ async def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_referral_once ON ledger(user_id, reason) WHERE reason LIKE 'referral:%';
         CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id, created_at DESC);
         """)
-        # Đảm bảo bảng users có cột bank_info nếu database cũ chưa có
         try:
             await c.execute("ALTER TABLE users ADD COLUMN bank_info TEXT")
         except Exception:
@@ -404,6 +403,7 @@ async def text_router(message: Message):
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔒 Khóa", callback_data=f"u:lock:{target['user_id']}"), InlineKeyboardButton(text="🔓 Mở khóa", callback_data=f"u:unlock:{target['user_id']}")],
                 [InlineKeyboardButton(text="➕ Cộng điểm", callback_data=f"u:add:{target['user_id']}"), InlineKeyboardButton(text="➖ Trừ điểm", callback_data=f"u:sub:{target['user_id']}")],
+                [InlineKeyboardButton(text="🗑 Reset Bank", callback_data=f"u:resetbank:{target['user_id']}")],
                 [InlineKeyboardButton(text="📩 Lịch sử mời", callback_data=f"u:refs:{target['user_id']}"), InlineKeyboardButton(text="💸 Lịch sử rút", callback_data=f"u:withdraws:{target['user_id']}")]
             ])
             await message.answer(f"👤 <b>Thông tin người dùng</b>\nID: <code>{target['user_id']}</code>\nUsername: {uname}\nTên: {target['first_name'] or '-'}\nSố dư: {target['balance']:,} điểm\nNgân hàng: <code>{bank_str}</code>\nKhóa: {'Có' if target['locked'] else 'Không'}\nNgày tạo: {target['created_at']:%d/%m/%Y}", reply_markup=kb)
@@ -490,12 +490,10 @@ async def text_router(message: Message):
 
     if text_in == "🏧 Rút + nạp 🏧":
         row = await user_row(uid)
-        # Kiểm tra nếu số dư chưa đạt tối thiểu 33,000 điểm
         if row['balance'] < MIN_WITHDRAW:
             await message.answer(f"❌ Số dư hiện tại của bạn là {row['balance']:,} điểm. Cần đạt tối thiểu từ {MIN_WITHDRAW:,} điểm trở lên mới có thể tạo lệnh rút tiền.", reply_markup=main_keyboard(uid))
             return
         
-        # Kiểm tra xem người dùng đã cập nhật thông tin ngân hàng chưa
         if not row['bank_info']:
             await set_state(uid, "bank_setup")
             await message.answer(
@@ -684,13 +682,19 @@ async def group_actions(call: CallbackQuery):
 async def user_admin_actions(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         await call.answer("Không có quyền.", show_alert=True); return
-    _, action, uid_s = call.data.split(":")
-    uid = int(uid_s)
+    parts = call.data.split(":")
+    action = parts[1]
+    uid = int(parts[2])
     await call.answer()
+    
     if action in ("lock", "unlock"):
         async with pool.acquire() as c:
             await c.execute("UPDATE users SET locked=$2 WHERE user_id=$1", uid, action == "lock")
         await call.message.answer("✅ Đã cập nhật trạng thái khóa.")
+    elif action == "resetbank":
+        async with pool.acquire() as c:
+            await c.execute("UPDATE users SET bank_info=NULL, updated_at=NOW() WHERE user_id=$1", uid)
+        await call.message.answer(f"✅ Đã reset (xóa) thông tin ngân hàng của người dùng <code>{uid}</code> thành công.")
     elif action in ("add", "sub"):
         await set_state(call.from_user.id, "admin_add" if action == "add" else "admin_sub", str(uid))
         await call.message.answer("Nhập số điểm cần điều chỉnh.")
@@ -721,4 +725,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        log.info("Bot stopped")
+        log.info("Bot stopped") 
