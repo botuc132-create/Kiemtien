@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timezone
 from typing import Optional
 
-import asyncpg
+import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
@@ -19,13 +19,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_PATH = os.getenv("DB_PATH", "bot_data.sqlite3").strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 MIN_WITHDRAW = int(os.getenv("MIN_WITHDRAW", "33000"))
 REFERRAL_REWARD = int(os.getenv("REFERRAL_REWARD", "1000"))
 
-if not TOKEN or not DATABASE_URL or not ADMIN_IDS:
-    raise RuntimeError("Thiếu BOT_TOKEN, DATABASE_URL hoặc ADMIN_IDS trong Railway Variables")
+if not TOKEN or not ADMIN_IDS:
+    raise RuntimeError("Thiếu BOT_TOKEN hoặc ADMIN_IDS trong Railway Variables")
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -35,7 +35,7 @@ log = logging.getLogger("reward_bot")
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-pool: Optional[asyncpg.Pool] = None
+pool = None
 
 MAIN_MENU = ["🏧 Rút + nạp 🏧", "👨‍💼 Cá Nhân 👨‍💼", "💌 Mời Bạn bè 💌"]
 ADMIN_MENU = ["🛠 Admin"]
@@ -63,40 +63,110 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+class SQLiteConnection:
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def execute(self, sql, *args):
+        sql = sql.replace("NOW()", "CURRENT_TIMESTAMP").replace(" FOR UPDATE", "")
+        sql = re.sub(r"\bBIGSERIAL\b", "INTEGER", sql, flags=re.I)
+        sql = re.sub(r"\bTIMESTAMPTZ\b", "TEXT", sql, flags=re.I)
+        sql = re.sub(r"\bBIGINT\b", "INTEGER", sql, flags=re.I)
+        sql = re.sub(r"\bBOOLEAN\b", "INTEGER", sql, flags=re.I)
+        if not args and sql.count(";") > 1:
+            await self.conn.executescript(sql)
+            return None
+        indexes = [int(x) for x in re.findall(r"\$(\d+)", sql)]
+        if indexes:
+            sql = re.sub(r"\$\d+", "?", sql)
+            args = tuple(args[i-1] for i in indexes)
+        cur = await self.conn.execute(sql, args)
+        return cur
+
+    @staticmethod
+    def _row(row):
+        out = dict(row)
+        for key in ("created_at", "updated_at", "decided_at"):
+            value = out.get(key)
+            if isinstance(value, str):
+                try: out[key] = datetime.fromisoformat(value)
+                except ValueError: pass
+        return out
+
+    async def fetchrow(self, sql, *args):
+        cur = await self.execute(sql, *args)
+        row = await cur.fetchone() if cur else None
+        return self._row(row) if row else None
+
+    async def fetch(self, sql, *args):
+        cur = await self.execute(sql, *args)
+        rows = await cur.fetchall() if cur else []
+        return [self._row(r) for r in rows]
+
+    async def fetchval(self, sql, *args):
+        cur = await self.execute(sql, *args)
+        row = await cur.fetchone() if cur else None
+        return row[0] if row else None
+
+    def transaction(self):
+        return SQLiteTransaction(self.conn)
+
+
+class SQLiteTransaction:
+    def __init__(self, conn): self.conn = conn
+    async def __aenter__(self): await self.conn.execute("BEGIN IMMEDIATE")
+    async def __aexit__(self, typ, value, tb):
+        await (self.conn.rollback() if typ else self.conn.commit())
+
+
+class SQLitePool:
+    def __init__(self, path): self.path = path
+    class Acquire:
+        def __init__(self, path): self.path = path; self.conn = None
+        async def __aenter__(self):
+            self.conn = await aiosqlite.connect(self.path, isolation_level=None)
+            self.conn.row_factory = aiosqlite.Row
+            await self.conn.execute("PRAGMA foreign_keys=ON")
+            await self.conn.execute("PRAGMA busy_timeout=10000")
+            return SQLiteConnection(self.conn)
+        async def __aexit__(self, *args): await self.conn.close()
+    def acquire(self): return self.Acquire(self.path)
+    async def close(self): pass
+
+
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=8, command_timeout=15,
-                                     server_settings={"application_name": "telegram_reward_bot"})
+    pool = SQLitePool(DB_PATH)
     async with pool.acquire() as c:
         await c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-          user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT,
-          balance BIGINT NOT NULL DEFAULT 0, locked BOOLEAN NOT NULL DEFAULT FALSE,
-          invited_by BIGINT, verified BOOLEAN NOT NULL DEFAULT FALSE,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+          balance INTEGER NOT NULL DEFAULT 0, locked INTEGER NOT NULL DEFAULT 0,
+          invited_by INTEGER, verified INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS required_groups (
-          id BIGSERIAL PRIMARY KEY, chat_id TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
-          join_url TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+          join_url TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS withdrawals (
-          id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(user_id),
-          amount BIGINT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), decided_at TIMESTAMPTZ, decided_by BIGINT
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id),
+          amount INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, decided_at TEXT, decided_by INTEGER
         );
         CREATE TABLE IF NOT EXISTS ledger (
-          id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(user_id),
-          amount BIGINT NOT NULL, reason TEXT NOT NULL, actor_id BIGINT,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(user_id),
+          amount INTEGER NOT NULL, reason TEXT NOT NULL, actor_id INTEGER,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS user_state (user_id BIGINT PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS user_state (user_id INTEGER PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL DEFAULT '');
         CREATE INDEX IF NOT EXISTS idx_withdrawals_status ON withdrawals(status, created_at DESC);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_referral_once ON ledger(user_id, reason) WHERE reason LIKE 'referral:%';
         CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id, created_at DESC);
         """)
         await c.execute("INSERT INTO settings(key,value) VALUES('maintenance','0') ON CONFLICT(key) DO NOTHING")
-    log.info("Database connected and schema ready")
+    log.info("Local SQLite database ready: %s", DB_PATH)
 
 
 async def get_state(uid: int):
